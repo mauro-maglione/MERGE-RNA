@@ -301,14 +301,18 @@ class ExperimentFit(Experiment):
         return e_beta_mu, e_beta_mu_prime, p_cb_given_sb_nb
     
     # 1b: compute p(s_b)
-    def compute_pairing_probabilities(self, fold_compound, rescale=False):
+    def compute_pairing_probabilities(self, fold_compound, rescale=False
+                                      , return_free_energy=False): ###added this flag
         '''Compute the pairing probabilities. Note: this does not apply soft constrains'''
         RNA.cvar.temperature = self.temp_C
         if rescale:
             fold_compound.exp_params_rescale(fold_compound.mfe()[1]*0.01) # rescale the energy parameters to avoid pf overflow
-        fold_compound.pf()
+        ### fold_compound.pf() 
+        _, ensemble_free_energy = fold_compound.pf() ###now we save the free energy
         bpp = np.array(fold_compound.bpp())[1:,1:]   # base pair probability matrix. Ask Giovanni for the [1:,1:]
         pairing = np.sum(bpp+bpp.T,axis=0)    # pairing probability for each base
+        if return_free_energy:
+            return pairing, ensemble_free_energy
         return pairing
 
     def dps_dlambda_sc(self, penalty, p_sb, lambda_sc):
@@ -345,7 +349,10 @@ class ExperimentFit(Experiment):
         else: # it's probably the same lol
             self.apply_soft_constraints(lambda_sc_array, fold_compound)
         # compute pairing probabilities
-        pairing_probs = self.compute_pairing_probabilities(fold_compound)
+        ### pairing_probs = self.compute_pairing_probabilities(fold_compound)
+        pairing_probs, F_lam = self.compute_pairing_probabilities(
+            fold_compound, return_free_energy=True) ###modified the function to also return the free energy
+
         # interpolate
         if interpolate and lambda_sc_array is not None:
             # compute derivatives wrt lambda_sc
@@ -374,7 +381,8 @@ class ExperimentFit(Experiment):
                 lambda_cache = None if lambda_sc_array is None else lambda_sc_array.copy()
         if lambda_sc_array is None:
             lambda_cache = None
-        self._cached_pairing_probs = {'penalty': penalty, 'lambda_sc': None if lambda_cache is None else lambda_cache.copy(), 'pairing_probs': pairing_probs, 'interpolated': interpolate}
+        self._cached_pairing_probs = {'penalty': penalty, 'lambda_sc': None if lambda_cache is None else lambda_cache.copy(), 'pairing_probs': pairing_probs, 'interpolated': interpolate,
+                                      'F_lam': F_lam, } ### we also cache the free energy computed with certain value of lambda
 
     def compare_keys_of_cached_ps(self, penalty, lambda_sc, interpolated):
         '''Compare the keys of the cached pairing probabilities with the current ones.'''
@@ -743,6 +751,93 @@ class ExperimentFit(Experiment):
         # we have to pack the p_bind component into a dictionary
         grad['p_bind'] = convert_p_bind_1d_to_dict(grad['p_bind'], False)
         return loss, grad
+    
+    def _get_F0(self, penalty):
+        """
+        Free energy of the reference distribution p_0: same physical parameters
+        (penalty from mu_r, p_b) but NO soft constraints (lambda_sc = 0).
+    
+        In phase 2, penalty is constant for a given experiment (so for a given concentration 
+        and after the parameter fitting)→ this is computed once and cached.
+        The cache is invalidated if penalty changes (e.g. simultaneous-mode fitting).
+        """
+        # Check cache
+        cached = getattr(self, '_F0_cache', None)
+        if cached is not None and np.isclose(cached['penalty'], penalty, rtol=1e-10): #do not recompute if penalties did not chenge significantly
+            return cached['F0']
+
+    
+        # Build the same fold compound as in compute_and_store_ps_and_derivatives,
+        # but with NO soft constraints applied.
+        fold_compound = RNA.fold_compound(self.seq)
+        RNA.cvar.temperature = self.temp_C
+        self.apply_penalty_for_paired_bases(penalty, fold_compound)
+        # Deliberately skip apply_soft_constraints → this IS the p_0 distribution
+    
+        _, F0 = fold_compound.pf()   # kcal/mol
+    
+        self._F0_cache = {'penalty': penalty, 'F0': F0}
+        return F0
+    
+    
+    def kl_and_grad(self, lambda_sc):
+        """
+        Compute D_KL(p_λ || p_0) and its gradient w.r.t. lambda_sc.
+    
+        All expensive quantities (pairing probs, dps_dlambda_sc, F_λ) are taken
+        from the cache filled during the forward pass in the same optimizer step.
+        The only potentially non-cached call is _get_F0(), which is O(1) in
+        phase 2 (computed once, then cached).
+    
+        Args:
+            lambda_sc : 1-D array, shape (N_seq,), soft-constraint parameters
+    
+        Returns:
+            kl      : scalar, D_KL(p_λ || p_0)  [dimensionless]
+            grad_kl : 1-D array, shape (N_seq,), ∂D_KL/∂λ
+        """
+        assert 'penalty' in self._cached_pairing_probs, \
+            "penalty not in cache — run get_ps() first to compute_and_store_ps_and_derivatives()"
+        assert self._cached_pairing_probs is not None, \
+            "kl_and_grad() called before forward pass — run get_ps() first"
+        assert self._cached_gradients is not None, \
+            "kl_and_grad() called before gradient computation — ensure compute_derivatives_anyway=True"
+        assert 'F_lam' in self._cached_pairing_probs, \
+            "F_lam not in cache — apply Piece 2 to compute_and_store_ps_and_derivatives()"
+    
+        # --- quantities from cache (free, already computed this step) -----------
+        penalty = self._cached_pairing_probs['penalty']   # a lot of doubts on this, would not be needed if there was no need to calculate F0
+        p_sb = self._cached_pairing_probs['pairing_probs']       # (N_seq,)
+        dps  = self._cached_gradients['dps_dlambda_sc']           # (N_seq, N_seq): [i,j] = ∂p_sb_i/∂λⱼ
+        F_lam = self._cached_pairing_probs['F_lam']               # kcal/mol
+    
+        # --- reference free energy (cached after first call) -------------------
+        F0 = self._get_F0(penalty)                                # kcal/mol
+    
+        # --- D_KL ---------------------------------------------------------------
+        # Both terms are dimensionless.
+        # If lambda_sc is in kcal/mol (ViennaRNA native units):
+        kl = (-np.dot(lambda_sc, p_sb) + (F_lam - F0)) / self.kBT
+    
+        # If lambda_sc is dimensionless (kBT units), use instead:
+        # kl = -np.dot(lambda_sc, p_sb) + (F_lam - F0) / self.kBT
+    
+        # D_KL must be non-negative; small negative values indicate numerical noise.
+        if kl < -1e-6:
+            self.logger.warning(f"kl_and_grad: D_KL = {kl:.6f} < 0 — possible numerical issue")
+    
+        # --- gradient -----------------------------------------------------------
+        # ∂D_KL/∂λⱼ = −(1/kBT) Σᵢ λᵢ (∂p_sb_i/∂λⱼ)
+        #            = −(1/kBT) [dps.T @ lambda_sc]ⱼ
+        #
+        # dps.T[j, i] = ∂p_sb_i/∂λⱼ
+        # (dps.T @ lambda_sc)[j] = Σᵢ ∂p_sb_i/∂λⱼ · λᵢ   ✓
+        grad_kl = -(dps.T @ lambda_sc) / self.kBT
+    
+        # (Same unit note as above: drop / self.kBT if lambda_sc is dimensionless)
+    
+        return kl, grad_kl
+
 
 def group_by_system(experiments):
     '''Takes in input a list of Experiment instances and
@@ -1249,6 +1344,7 @@ class MultiSystemsFit:
     # - 'physical_only': only fit physical parameters, keep lambda_sc fixed
     # - 'lambda_only': only fit lambda_sc, keep physical parameters fixed  
     # - 'sequential': first fit physical params only, then fix them and fit lambda_sc (default)
+    reg_weight: float = 0.0 ### weight for the KL divergence regularization term that penalizes deviation of lambda_sc from zero (added to the loss function)
     fit_mode: str = 'sequential'
     # linear_mode: enforce mu_r <= 0 and p_b fixed to 0 (linear regime where penalty = mu_r).
     linear_mode: bool = False
@@ -1601,7 +1697,8 @@ class MultiSystemsFit:
                 # Append the lambda_sc guesses for this system
                 initial_guess = np.append(initial_guess, lambda_guess)
                 # Extend bounds for each lambda_sc parameter
-                bounds.extend([(-1, 1)] * n_seq)
+                ###bounds.extend([(-1, 1)] * n_seq) modified for KL divergence use
+                bounds.extend([(None, None)] * n_seq) ### no bound for KL divergence use
         
         # Total number of parameters computed so far
         self.N_params_tot = len(initial_guess)
@@ -2034,6 +2131,18 @@ class MultiSystemsFit:
                         loss_train += loss_exp
                         if compute_gradient:
                             grad_tot += self.map_system_grad_to_total(grad_exp, system)
+            
+                ### added for KL divergence use, this should from here
+            
+                if self.infer_1D_sc and not self.fix_lambda_sc and self.reg_weight > 0:
+                    lsc_idx = system.dict_with_params_pos['lambda_sc']
+                    lambda_sc = params_1D[lsc_idx]
+                    kl, dkl = exp_fit.kl_and_grad(lambda_sc)
+                    loss_train += self.reg_weight * kl
+                    grad_tot[lsc_idx] += self.reg_weight * dkl #maybe it would be better to have a dict of dkl and use map_system_grad_to_total
+
+                ### to here
+
         self.losses_exp_fit = losses_exp_fit
         assert grad_tot.shape == params_1D.shape, "Gradient shape mismatch!"
         # Put the gradient to zero for the physical parameters if fix_physical_params is True
