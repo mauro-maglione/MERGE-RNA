@@ -780,62 +780,54 @@ class ExperimentFit(Experiment):
         return F0
     
     
-    def kl_and_grad(self, lambda_sc):
+    def kl_and_grad(self, lambda_sc, compute_gradient=True):
         """
-        Compute D_KL(p_λ || p_0) and its gradient w.r.t. lambda_sc.
-    
-        All expensive quantities (pairing probs, dps_dlambda_sc, F_λ) are taken
-        from the cache filled during the forward pass in the same optimizer step.
-        The only potentially non-cached call is _get_F0(), which is O(1) in
-        phase 2 (computed once, then cached).
-    
+        Compute D_KL(p_λ || p_0) and optionally its gradient w.r.t. lambda_sc.
+
+        All expensive quantities (pairing probs and F_λ) are taken from the cache
+        filled during the forward pass in the same optimizer step. If gradient is
+        requested and not already cached, it is computed on demand.
+
         Args:
             lambda_sc : 1-D array, shape (N_seq,), soft-constraint parameters
-    
+            compute_gradient : bool, whether to compute the gradient
+
         Returns:
             kl      : scalar, D_KL(p_λ || p_0)  [dimensionless]
-            grad_kl : 1-D array, shape (N_seq,), ∂D_KL/∂λ
+            grad_kl : 1-D array, shape (N_seq,), ∂D_KL/∂λ or None if compute_gradient=False
         """
-        assert 'penalty' in self._cached_pairing_probs, \
-            "penalty not in cache — run get_ps() first to compute_and_store_ps_and_derivatives()"
         assert self._cached_pairing_probs is not None, \
             "kl_and_grad() called before forward pass — run get_ps() first"
-        assert self._cached_gradients is not None, \
-            "kl_and_grad() called before gradient computation — ensure compute_derivatives_anyway=True"
+        assert 'penalty' in self._cached_pairing_probs, \
+            "penalty not in cache — run get_ps() first to compute_and_store_ps_and_derivatives()"
         assert 'F_lam' in self._cached_pairing_probs, \
             "F_lam not in cache — apply Piece 2 to compute_and_store_ps_and_derivatives()"
-    
+
         # --- quantities from cache (free, already computed this step) -----------
-        penalty = self._cached_pairing_probs['penalty']   # a lot of doubts on this, would not be needed if there was no need to calculate F0
+        penalty = self._cached_pairing_probs['penalty']
         p_sb = self._cached_pairing_probs['pairing_probs']       # (N_seq,)
-        dps  = self._cached_gradients['dps_dlambda_sc']           # (N_seq, N_seq): [i,j] = ∂p_sb_i/∂λⱼ
         F_lam = self._cached_pairing_probs['F_lam']               # kcal/mol
-    
+
         # --- reference free energy (cached after first call) -------------------
         F0 = self._get_F0(penalty)                                # kcal/mol
-    
+
         # --- D_KL ---------------------------------------------------------------
-        # Both terms are dimensionless.
-        # If lambda_sc is in kcal/mol (ViennaRNA native units):
         kl = (-np.dot(lambda_sc, p_sb) + (F_lam - F0)) / self.kBT
-    
-        # If lambda_sc is dimensionless (kBT units), use instead:
-        # kl = -np.dot(lambda_sc, p_sb) + (F_lam - F0) / self.kBT
-    
-        # D_KL must be non-negative; small negative values indicate numerical noise.
+
         if kl < -1e-6:
             self.logger.warning(f"kl_and_grad: D_KL = {kl:.6f} < 0 — possible numerical issue")
-    
+
+        if not compute_gradient:
+            return kl, None
+
         # --- gradient -----------------------------------------------------------
-        # ∂D_KL/∂λⱼ = −(1/kBT) Σᵢ λᵢ (∂p_sb_i/∂λⱼ)
-        #            = −(1/kBT) [dps.T @ lambda_sc]ⱼ
-        #
-        # dps.T[j, i] = ∂p_sb_i/∂λⱼ
-        # (dps.T @ lambda_sc)[j] = Σᵢ ∂p_sb_i/∂λⱼ · λᵢ   ✓
+        if self._cached_gradients is None or not self.compare_keys_of_cached_gradients(
+                penalty, lambda_sc, self._cached_pairing_probs['interpolated']):
+            dps = self.get_dps_dlambda_sc(penalty, lambda_sc, self._cached_pairing_probs['interpolated'])
+        else:
+            dps = self._cached_gradients['dps_dlambda_sc']
+
         grad_kl = -(dps.T @ lambda_sc) / self.kBT
-    
-        # (Same unit note as above: drop / self.kBT if lambda_sc is dimensionless)
-    
         return kl, grad_kl
 
 
@@ -1358,6 +1350,11 @@ class MultiSystemsFit:
     log_file_path: str = field(init=False)
     logger: logging.Logger = field(init=False)  # logger used for printing
     last_plot_callback_time: Optional[float] = field(init=False)  # time of the last plot callback
+    kl_losses_exp_fit: dict = field(init=False)  # KL divergence losses for each experiment
+    # kl_history: List[float] = field(init=False)  # history of KL divergence losses across iterations
+    # nll_history: List[float] = field(init=False)  # history of negative log-likelihood losses across iterations
+    # kl_last_step: float =0.0  # KL divergence loss at the last optimization step 
+    # nll_last_step: float = 0.0  # NLL loss at the last optimization step    
 
     def __post_init__(self):
         # Validate fit_mode
@@ -1427,6 +1424,9 @@ class MultiSystemsFit:
         self.evaluation_count = 0
         self.params_history = {'mu_r': [], 'p_b': [], 'p_bind': {key: [] for key in [(0, 'A'), (0, 'C'), (0, 'G'), (0, 'U'), (1, 'A'), (1, 'C'), (1, 'G'), (1, 'U')]}, 'm0': [], 'm1': []}
         self.current_phase = None  # For sequential mode: 1 = physical params, 2 = lambda_sc
+
+        # self.kl_history = []
+        # self.nll_history = []
 
     def _handle_existing_output_dir(self):
         """
@@ -1698,7 +1698,7 @@ class MultiSystemsFit:
                 initial_guess = np.append(initial_guess, lambda_guess)
                 # Extend bounds for each lambda_sc parameter
                 ###bounds.extend([(-1, 1)] * n_seq) modified for KL divergence use
-                bounds.extend([(None, None)] * n_seq) ### no bound for KL divergence use
+                bounds.extend([(-100, 100)] * n_seq) ### no bound for KL divergence use
         
         # Total number of parameters computed so far
         self.N_params_tot = len(initial_guess)
@@ -1865,6 +1865,9 @@ class MultiSystemsFit:
             initial_params=phase2_initial
         )
         
+        # self.kl_history  = [] # Reset KL history for phase 2
+        # self.nll_history = [] # Reset NLL history for phase 2
+
         self.logger.info("")
         self.logger.info("=" * 60)
         self.logger.info("SEQUENTIAL FITTING COMPLETE")
@@ -2066,13 +2069,17 @@ class MultiSystemsFit:
     def multisys_loss_and_grad(self, params_1D, compute_gradient=True):
         self.logger.debug(f'multysys_loss_and_grad called')
         losses_exp_fit = {}  # loss of each experiment fit
+        kl_losses_exp_fit = {}  # KL contributions for diagnostics, don't know if I want to use it yet
         loss_train = 0
         grad_tot = np.zeros_like(params_1D)  # total gradient (only training)
+        #kl_total = 0.0 ###
+
         for system in self.systems:
             # find params from each system
             params_dict = self.pack_params(params_1D, system)
             mut_profiles_dict = {}
             grad_mut_profiles_dict = {}
+
             for exp_fit in system.exp_fits_all:
                 # if mut_profile not computed OR (in training, gradient needed but current gradient is not yet computed) then compute with gradient as required
                 if (exp_fit.conc_mM not in mut_profiles_dict.keys() or 
@@ -2131,19 +2138,26 @@ class MultiSystemsFit:
                         loss_train += loss_exp
                         if compute_gradient:
                             grad_tot += self.map_system_grad_to_total(grad_exp, system)
-            
-                ### added for KL divergence use, this should from here
-            
+
+                ### block added for kl divergence regularization of lambda_sc parameters
                 if self.infer_1D_sc and not self.fix_lambda_sc and self.reg_weight > 0:
                     lsc_idx = system.dict_with_params_pos['lambda_sc']
                     lambda_sc = params_1D[lsc_idx]
-                    kl, dkl = exp_fit.kl_and_grad(lambda_sc)
-                    loss_train += self.reg_weight * kl
-                    grad_tot[lsc_idx] += self.reg_weight * dkl #maybe it would be better to have a dict of dkl and use map_system_grad_to_total
-
-                ### to here
+                    if exp_fit in system.exp_fits_train:
+                        kl, dkl = exp_fit.kl_and_grad(lambda_sc, compute_gradient=True)
+                        loss_train += self.reg_weight * kl
+                        grad_tot[lsc_idx] += self.reg_weight * dkl
+                        kl_losses_exp_fit[exp_fit.ID] = self.reg_weight * kl 
+                        #kl_total += self.reg_weight * kl
+                    else:
+                        kl, _ = exp_fit.kl_and_grad(lambda_sc, compute_gradient=False)
+                        kl_losses_exp_fit[exp_fit.ID] = self.reg_weight * kl 
+                
+        # self.kl_last_step  = kl_total  # total KL contribution this step
+        # self.nll_last_step = loss_train - kl_total  # NLL only, before regularization
 
         self.losses_exp_fit = losses_exp_fit
+        self.kl_losses_exp_fit = kl_losses_exp_fit #don't know if I want to use it yet
         assert grad_tot.shape == params_1D.shape, "Gradient shape mismatch!"
         # Put the gradient to zero for the physical parameters if fix_physical_params is True
         if self.fix_physical_params:
@@ -2414,7 +2428,9 @@ class MultiSystemsFit:
             raise KeyboardInterrupt("Stopping optimization after 24 hours.")
 
         # Calculate total loss
-        total_loss = sum(self.losses_exp_fit.values())
+        total_nll = sum(self.losses_exp_fit.values())
+        total_kl = sum(self.kl_losses_exp_fit.values())
+        total_loss = total_nll + total_kl
 
         # Log losses to detailed log file (info for first/last, debug otherwise)
         if self.iteration_count <= 1 or last_callback:
@@ -2426,7 +2442,16 @@ class MultiSystemsFit:
         # Log to summary log (sampled: every 10 iterations, or first/last)
         if self.iteration_count == 1 or self.iteration_count % 10 == 0 or last_callback:
             with open(self.summary_log_path, 'a') as f:
-                f.write(f"Iteration {self.iteration_count:5d}: Total loss = {total_loss:.6f}\n")
+                f.write(
+                    f"Iteration {self.iteration_count:5d}: "
+                    f"Total = {total_loss:.4f}  "
+                    f"NLL = {total_nll:.4f}  "
+                    f"KL_reg = {total_kl:.4f}  "
+                    f"KL/NLL = {total_kl/total_nll:.3f}\n"
+                    if total_nll > 0 else
+                    f"Iteration {self.iteration_count:5d}: Total = {total_loss:.4f}\n"
+                )
+
 
         # Print self-updating iteration counter to stdout (overwrite same line)
         if self.print_to_std_out and not last_callback:
@@ -2443,6 +2468,10 @@ class MultiSystemsFit:
             for system in self.systems:
                 for exp_fit in system.exp_fits_all:
                     exp_fit.loss_history.append(self.losses_exp_fit[exp_fit.ID])
+
+            # self.kl_history.append(getattr(self, 'kl_last_step', 0.0))
+            # self.nll_history.append(getattr(self, 'nll_last_step', sum(self.losses_exp_fit.values())))
+
             params_dict = self.pack_params(params, self.systems[0])
             # update params history dictionary
             for param, history in self.params_history.items():

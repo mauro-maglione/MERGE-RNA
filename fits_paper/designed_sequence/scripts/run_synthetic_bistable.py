@@ -66,7 +66,8 @@ for pop1 in POP1_VALUES:
         infer_1D_sc=True,
         fit_mode='sequential',
         do_plots=True,
-        print_to_std_out=True
+        print_to_std_out=True,
+        reg_weight=100. ### weight of regularization
     )
     
     result = multi_sys.fit()
