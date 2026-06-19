@@ -337,6 +337,11 @@ class ExperimentFit(Experiment):
     
     def compute_and_store_ps_and_derivatives(self, penalty, lambda_sc, interpolate, compute_derivatives_anyway=False):
         lambda_sc_array = None if lambda_sc is None else np.asarray(lambda_sc, dtype=float)
+        """
+        Note: when Vienna applies soft-constraints to modify the pairing prob of a single base pair it does disfavoring 
+        by adding an energy when the nucleotide is unpaired (fold_compound.sc_add_up(...) in apply_soft_constraints) and so 
+        this has to be taken in consideration when one is interested in the value of the free energy
+        """
         lambda_cache = None
         fold_compound = RNA.fold_compound(self.seq)
         RNA.cvar.temperature = self.temp_C
@@ -807,6 +812,7 @@ class ExperimentFit(Experiment):
         penalty = self._cached_pairing_probs['penalty']
         p_sb = self._cached_pairing_probs['pairing_probs']       # (N_seq,)
         F_lam = self._cached_pairing_probs['F_lam']               # kcal/mol
+        F_lam += sum(lam for lam in lambda_sc if lam<0) # Vienna can favor unpaired bases, while we suppose to be favoring paired ones
 
         # --- reference free energy (cached after first call) -------------------
         F0 = self._get_F0(penalty)                                # kcal/mol
@@ -821,9 +827,8 @@ class ExperimentFit(Experiment):
             return kl, None
 
         # --- gradient -----------------------------------------------------------
-        if self._cached_gradients is None or not self.compare_keys_of_cached_gradients(
-                penalty, lambda_sc, self._cached_pairing_probs['interpolated']):
-            dps = self.get_dps_dlambda_sc(penalty, lambda_sc, self._cached_pairing_probs['interpolated'])
+        if self._cached_gradients is None:
+            dps = self.get_dps_dlambda_sc(penalty, lambda_sc, self.use_interpolated_ps)
         else:
             dps = self._cached_gradients['dps_dlambda_sc']
 
@@ -1336,8 +1341,8 @@ class MultiSystemsFit:
     # - 'physical_only': only fit physical parameters, keep lambda_sc fixed
     # - 'lambda_only': only fit lambda_sc, keep physical parameters fixed  
     # - 'sequential': first fit physical params only, then fix them and fit lambda_sc (default)
-    reg_weight: float = 0.0 ### weight for the KL divergence regularization term that penalizes deviation of lambda_sc from zero (added to the loss function)
     fit_mode: str = 'sequential'
+    reg_weight: float = 0.0 ### weight for the KL divergence regularization term that penalizes deviation of lambda_sc from zero (added to the loss function)
     # linear_mode: enforce mu_r <= 0 and p_b fixed to 0 (linear regime where penalty = mu_r).
     linear_mode: bool = False
     iteration_count: int = 0  # number of iterations
@@ -2322,6 +2327,7 @@ class MultiSystemsFit:
                 "fix_physical_params": self.fix_physical_params,
                 "fix_lambda_sc": self.fix_lambda_sc,
                 "strict_convergence": self.strict_convergence,
+                "regularization_weight": self.reg_weight,
                 "max_iter": self.max_iter,
                 "mask_edges": list(self.mask_edges) if self.mask_edges else None,
                 "description": self.description
@@ -2342,8 +2348,10 @@ class MultiSystemsFit:
                 "converged": converged,
                 "convergence_message": convergence_message,
                 "total_loss": total_loss,
+                "total_kl": sum(self.kl_losses_exp_fit.values()) if hasattr(self, 'kl_losses_exp_fit') else 0.0,
                 "current_phase": self.current_phase,
-                "losses_per_experiment": {str(k): v for k, v in self.losses_exp_fit.items()} if hasattr(self, 'losses_exp_fit') else {}
+                "losses_per_experiment": {str(k): v for k, v in self.losses_exp_fit.items()} if hasattr(self, 'losses_exp_fit') else {},
+                "kl_losses_per_experiment": {str(k): v for k, v in self.kl_losses_exp_fit.items()} if hasattr(self, 'kl_losses_exp_fit') else {}
             },
 
             "systems": []
