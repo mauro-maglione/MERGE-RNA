@@ -1359,7 +1359,8 @@ class MultiSystemsFit:
     # kl_history: List[float] = field(init=False)  # history of KL divergence losses across iterations
     # nll_history: List[float] = field(init=False)  # history of negative log-likelihood losses across iterations
     # kl_last_step: float =0.0  # KL divergence loss at the last optimization step 
-    # nll_last_step: float = 0.0  # NLL loss at the last optimization step    
+    # nll_last_step: float = 0.0  # NLL loss at the last optimization step
+    bound_soft_constraints = (-1,1)    
 
     def __post_init__(self):
         # Validate fit_mode
@@ -1703,7 +1704,7 @@ class MultiSystemsFit:
                 initial_guess = np.append(initial_guess, lambda_guess)
                 # Extend bounds for each lambda_sc parameter
                 ###bounds.extend([(-1, 1)] * n_seq) modified for KL divergence use
-                bounds.extend([(-100, 100)] * n_seq) ### no bound for KL divergence use
+                bounds.extend([self.bound_soft_constraints] * n_seq) ### no bound for KL divergence use
         
         # Total number of parameters computed so far
         self.N_params_tot = len(initial_guess)
