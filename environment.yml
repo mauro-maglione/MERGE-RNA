@@ -1,4 +1,4 @@
-name: merge-rna
+name: merge-rna-patched
 channels:
   - conda-forge
   - bioconda
@@ -139,7 +139,6 @@ dependencies:
   - typing_extensions=4.13.1
   - tzdata=2025b
   - unicodedata2=16.0.0
-  - viennarna=2.7.0
   - wcwidth=0.2.13
   - webencodings=0.5.1
   - wheel=0.45.1
