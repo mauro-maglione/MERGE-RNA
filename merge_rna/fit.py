@@ -279,6 +279,7 @@ class ExperimentFit(Experiment):
     # soft constrains from p_b
     def apply_penalty_for_paired_bases(self, penalty, fold_compound):
         # if penalties is negative, alternative implementation is needed, but for p_b>0 you get m>0
+        #penalty_rounded = np.round(penalty, 2) ### test where you round penalties
         for i in range(self.N_seq):
             for j in range(i+1,self.N_seq):
                 fold_compound.sc_add_bp(i+1,j+1,2*penalty) # penalty is already in kcal/mol
@@ -1360,7 +1361,7 @@ class MultiSystemsFit:
     # nll_history: List[float] = field(init=False)  # history of negative log-likelihood losses across iterations
     # kl_last_step: float =0.0  # KL divergence loss at the last optimization step 
     # nll_last_step: float = 0.0  # NLL loss at the last optimization step
-    bound_soft_constraints = (-1,1)    
+    bound_soft_constraints:tuple = (-1,1)   
 
     def __post_init__(self):
         # Validate fit_mode
@@ -1931,6 +1932,7 @@ class MultiSystemsFit:
             try:
                 self.fit_result = minimize(self.multisys_loss_and_grad, initial_guess, 
                                            method='L-BFGS-B', bounds=bounds, jac=True, 
+                                           #tol=0.0001,
                                            options=options, callback=self.callback)
                 with open(self.log_file_path, 'a') as f:
                     self.logger.info(f'Fit result:\n {self.fit_result}')
@@ -2153,11 +2155,11 @@ class MultiSystemsFit:
                         kl, dkl = exp_fit.kl_and_grad(lambda_sc, compute_gradient=True)
                         loss_train += self.reg_weight * kl
                         grad_tot[lsc_idx] += self.reg_weight * dkl
-                        kl_losses_exp_fit[exp_fit.ID] = self.reg_weight * kl 
+                        kl_losses_exp_fit[exp_fit.ID] = kl 
                         #kl_total += self.reg_weight * kl
                     else:
                         kl, _ = exp_fit.kl_and_grad(lambda_sc, compute_gradient=False)
-                        kl_losses_exp_fit[exp_fit.ID] = self.reg_weight * kl 
+                        kl_losses_exp_fit[exp_fit.ID] = kl 
                 
         # self.kl_last_step  = kl_total  # total KL contribution this step
         # self.nll_last_step = loss_train - kl_total  # NLL only, before regularization
@@ -2439,7 +2441,7 @@ class MultiSystemsFit:
         # Calculate total loss
         total_nll = sum(self.losses_exp_fit.values())
         total_kl = sum(self.kl_losses_exp_fit.values())
-        total_loss = total_nll + total_kl
+        total_loss = total_nll + self.reg_weight*total_kl
 
         # Log losses to detailed log file (info for first/last, debug otherwise)
         if self.iteration_count <= 1 or last_callback:
@@ -2455,7 +2457,7 @@ class MultiSystemsFit:
                     f"Iteration {self.iteration_count:5d}: "
                     f"Total = {total_loss:.4f}  "
                     f"NLL = {total_nll:.4f}  "
-                    f"KL_reg = {total_kl:.4f}  "
+                    f"KL = {total_kl:.4f}  "
                     f"KL/NLL = {total_kl/total_nll:.3f}\n"
                     if total_nll > 0 else
                     f"Iteration {self.iteration_count:5d}: Total = {total_loss:.4f}\n"

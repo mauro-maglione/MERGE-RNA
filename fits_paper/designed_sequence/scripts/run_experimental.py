@@ -102,7 +102,7 @@ if args.phase in ('2', 'both'):
         raise FileNotFoundError(f'Phase 1 params not found: {phase1_params}')
 
     print(f"\n{'='*60}")
-    print(f"PHASE 2: fitting lambda_sc (use_interpolated_ps=True)")
+    print(f"PHASE 2: fitting lambda_sc (use_interpolated_ps=False)") ### changed to false since we use patched vienna
     print(f"  Physical params: {phase1_params}")
     print(f"{'='*60}")
 
@@ -110,7 +110,7 @@ if args.phase in ('2', 'both'):
         root_dir=ROOT_DIR_PHASE2,
         fit_mode='lambda_only',
         infer_1D_sc=True,
-        use_interpolated_ps=True,
+        use_interpolated_ps=False,  ### changed to false since we use patched vienna
         guess=phase1_params,
         **_common,
     ).fit()
