@@ -216,3 +216,27 @@ class MultiSystemsFitFixedLambdaPositions(MultiSystemsFit):
                     if local_idx not in free:
                         bounds[global_idx] = (0.0, 0.0)
         return initial_guess, bounds
+
+
+class MultiSystemsFitMaskedLambdaBounds(MultiSystemsFit):
+    """MultiSystemsFit variant where lambda_sc is pinned to 0 (zero-width bounds)
+    at every position excluded by custom_mask, for every system.
+
+    custom_mask alone only affects the loss (see ExperimentFit._parse_custom_mask /
+    position_mask in merge_rna/fit.py) -- it does NOT stop a masked-out lambda_sc from
+    moving during optimization, since dps_dlambda_sc is a dense Jacobian (RNA folding
+    is globally coupled). Only an explicit bound restricts which lambda_sc entries
+    actually vary, same reasoning as MultiSystemsFitFixedLambdaPositions above.
+    """
+
+    def initialize_guess_and_bounds(self, start_value=0.1, guess=None):
+        initial_guess, bounds = super().initialize_guess_and_bounds(start_value=start_value, guess=guess)
+        if self.infer_1D_sc:
+            for system in self.systems:
+                if system.custom_mask is None:
+                    continue
+                mask = system.exp_fits_all[0]._parse_custom_mask(system.custom_mask)
+                for local_idx, global_idx in enumerate(self.lambdas_indices[system.sys_name]):
+                    if not mask[local_idx]:
+                        bounds[global_idx] = (0.0, 0.0)
+        return initial_guess, bounds

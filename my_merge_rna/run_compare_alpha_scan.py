@@ -1,3 +1,4 @@
+# %%
 #!/usr/bin/env python3
 """
 Standalone, resumable alpha scan: merge-rna native fit vs maxent (chi-squared, binomial), POP1=0.8.
@@ -45,7 +46,9 @@ import RNA
 from scipy.optimize import minimize
 
 from merge_rna import Experiment, create_exp_synthetic_comb, MultiSystemsFit
+from scripts.synthetic_lambda_utils import MultiSystemsFitMaskedLambdaBounds
 
+# %%
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -56,6 +59,7 @@ PARAMS1D_PATH = os.path.join(
 POP1 = 0.8
 COVERAGE = 10000
 SEED = 42  # fixes the one binomial draw used across the whole scan
+SEED_VAL = 43  # fixes the one binomial draw used for validation
 
 ALPHAS = np.concatenate([[0.0], np.logspace(-2, 3, 21)])  # 0.01 ... 1000, ~4/decade
 
@@ -68,7 +72,8 @@ bounds_sc_tuple = (-5.,5.)
 
 N_PARALLEL_NATIVE = 8  # out of 20 cores on this shared machine -- leaves headroom for other users
 
-OUTPUT_DIR = os.path.join('fits_paper', 'designed_sequence', 'outputs', 'compare_alpha_scan_pop80_new')
+subfix_out = '30pcmask_nomerge'
+OUTPUT_DIR = os.path.join('fits_paper', 'designed_sequence', 'outputs', 'compare_alpha_scan_pop80_' + subfix_out)
 CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, 'checkpoints')
 
 METHOD_LABELS = {
@@ -77,6 +82,15 @@ METHOD_LABELS = {
     'maxent_binomial': 'maxent (binomial)',
 }
 
+RUN_MERGE_RNA = False   # set to True to re-enable the native merge-rna fits
+ACTIVE_METHODS = {k: v for k, v in METHOD_LABELS.items() if (RUN_MERGE_RNA or k != 'merge_rna')}
+
+len_seq = 148  # length of the designed sequence used in this scan
+#CUSTOM_MASK = np.concatenate([np.ones(len_seq//2, dtype=bool), np.zeros(len_seq//2, dtype=bool)])
+CUSTOM_MASK = np.concatenate([np.ones(50, dtype=bool), np.zeros(45, dtype=bool), np.ones(len_seq - 50 - 45, dtype=bool)])  # mask directly as array of bools, script expects file or a string with 01
+#CUSTOM_MASK = None  # no masking, all positions are free to be fit
+
+COVERAGE_FRACTION = 1.  # fraction of the total coverage to use for the synthetic data (for testing)
 
 def checkpoint_path(method, alpha):
     return os.path.join(CHECKPOINT_DIR, f'{method}_alpha_{alpha:.6g}.pkl')
@@ -104,6 +118,16 @@ def compute_expansion_parameters(z, T, a, b):
     target_contact_prob = (z - T * a) / (T * b)
     squared_confidence_interval = ((T - z) / T) * (z / T**2) / b**2
     return target_contact_prob, squared_confidence_interval
+
+
+def bounds_array_with_mask(n_seq, mask, bound_abs):
+    """(n_seq, 2) box-constraint array: (-bound_abs, bound_abs) everywhere, pinned to
+    (0.0, 0.0) at positions mask excludes (mask=None => no pinning)."""
+    boundaries = bound_abs * np.ones((n_seq, 2))
+    boundaries[:, 0] *= -1
+    if mask is not None:
+        boundaries[~mask] = (0.0, 0.0)
+    return boundaries
 
 
 def maxent(seq,bpp_ref,*, sigma_squared, penalty=None, boundaries=None, initial_guess=None, rescale=True,version=0,T=None,deriv_correct=False,alpha=0.0,tol=None):
@@ -351,9 +375,26 @@ def build_shared_context():
     np.savetxt(phys_only_guess_path, params_1D_ref)
 
     np.random.seed(SEED)
-    exp = create_exp_synthetic_comb(pop1=POP1, params_dict=params_dict_ref, noise=True, coverage=COVERAGE)
 
-    multi_score = MultiSystemsFit(experiments=[exp], validation_exps=None, infer_1D_sc=True, skip_output_setup=True)
+    if COVERAGE_FRACTION < 1.0:
+        fit_coverage = int(COVERAGE_FRACTION * COVERAGE)
+        valid_coverage = COVERAGE - fit_coverage
+
+        exp = create_exp_synthetic_comb(pop1=POP1, params_dict=params_dict_ref, noise=True, coverage=fit_coverage)
+
+        np.random.seed(SEED_VAL)
+        valid_exp = create_exp_synthetic_comb(pop1=POP1, params_dict=params_dict_ref, noise=True, coverage=valid_coverage)
+
+    else:
+        exp = create_exp_synthetic_comb(pop1=POP1, params_dict=params_dict_ref, noise=True, coverage=COVERAGE)
+        valid_exp = None
+
+    exp.df.to_csv(os.path.join(OUTPUT_DIR, 'synthetic_exp_df.csv'), index=False)
+    if valid_exp is not None:
+        valid_exp.df.to_csv(os.path.join(OUTPUT_DIR, 'synthetic_valid_exp_df.csv'), index=False)
+
+    multi_score = MultiSystemsFit(experiments=[exp], validation_exps=None, infer_1D_sc=True,
+                                   skip_output_setup=True, custom_mask=CUSTOM_MASK)
     exp_fit = multi_score.systems[0].exp_fits_train[0]
 
     mu_j = mu_r + exp_fit.kBT * np.log((exp_fit.conc_mM + .1) / 1000) if exp_fit.conc_mM is not None else mu_r
@@ -377,7 +418,7 @@ def build_shared_context():
 
     return dict(params_dict_ref=params_dict_ref, mu_r=mu_r, p_b=p_b, m0=m0, m1=m1,
                 p_bind_dict=p_bind_dict, phys_only_guess_path=phys_only_guess_path,
-                exp=exp, multi_score=multi_score, exp_fit=exp_fit, mu_j=mu_j,
+                exp=exp, valid_exp=valid_exp, multi_score=multi_score, exp_fit=exp_fit, mu_j=mu_j,
                 penalty=penalty, a_i=a_i, b_i=b_i)
 
 
@@ -418,11 +459,46 @@ def score(ctx, lambda_sc, alpha, opt_info):
     return result
 
 
+def rescore_checkpoint(ctx, res, alpha):
+    """Recompute a checkpoint's loss-derived fields (log_likelihood, kl_divergence,
+    total_loss, bpp, mut_rate_model) from its stored lambda_sc under the CURRENT ctx/masking,
+    instead of trusting whatever was cached at original fit time. Optimizer-diagnostic
+    fields (success/status/message/nit/grad_norm) are carried through unchanged since they
+    describe the actual optimization run, not the scoring."""
+    if res['lambda_sc'] is None:
+        return res
+    opt_info = {k: res[k] for k in ('success', 'status', 'message', 'nit', 'grad_norm')}
+    return score(ctx, res['lambda_sc'], alpha, opt_info)
+
+
+def log_likelihood_on_mask(exp_fit, mut_rate_model, mask):
+    """NLL under exp_fit's existing binomial loss, but restricted to `mask` instead of
+    exp_fit.position_mask. Reuses loss_and_grad's exact formula by temporarily swapping
+    the mask rather than re-deriving the log-likelihood."""
+    original_mask = exp_fit.position_mask
+    exp_fit.position_mask = mask
+    try:
+        nll, _ = exp_fit.loss_and_grad(mut_rate_model, None)
+    finally:
+        exp_fit.position_mask = original_mask
+    return -nll
+
+
+def mut_rate_model_for_lambda(ctx, lambda_sc):
+    exp_fit, mu_r, p_b, m0, m1, p_bind_dict = (
+        ctx['exp_fit'], ctx['mu_r'], ctx['p_b'], ctx['m0'], ctx['m1'], ctx['p_bind_dict'])
+    mut_rate_model, _ = exp_fit.mut_rate_and_its_grad(
+        mu_r=mu_r, p_b=p_b, p_bind=p_bind_dict, m0=m0, m1=m1,
+        lambda_sc=lambda_sc, compute_gradient=False)
+    return mut_rate_model
+
+
 # =============================================================================
 # Native leg worker (runs in a forked subprocess)
 # =============================================================================
 def run_native_fit(alpha, exp, phys_only_guess_path):
-    multi_native = MultiSystemsFit(
+    fit_cls = MultiSystemsFitMaskedLambdaBounds if CUSTOM_MASK is not None else MultiSystemsFit
+    multi_native = fit_cls(
         experiments=[exp],
         validation_exps=None,
         output_suffix=f'alpha_{alpha:.4g}',
@@ -435,7 +511,8 @@ def run_native_fit(alpha, exp, phys_only_guess_path):
         do_plots=False,
         print_to_std_out=False,
         overwrite=True,
-        bound_soft_constraints=bounds_sc_tuple
+        bound_soft_constraints=bounds_sc_tuple,
+        custom_mask=CUSTOM_MASK
     )
     result = multi_native.fit()
     lambda_idx = multi_native.systems[0].dict_with_params_pos['lambda_sc']
@@ -458,38 +535,42 @@ def run_scan():
     exp = ctx['exp']
     print(f"[{time.strftime('%H:%M:%S')}] Sanity check passed. N_seq={exp.N_seq}, "
           f"total mut_count={exp.df['mut_count'].sum()}", flush=True)
+ 
+    if RUN_MERGE_RNA:
+        # --- merge-rna native, in parallel across whatever alphas aren't already checkpointed ---
+        todo_native = [a for a in ALPHAS if load_checkpoint('merge_rna', a) is None]
+        print(f"[{time.strftime('%H:%M:%S')}] merge-rna native: {len(ALPHAS) - len(todo_native)}/{len(ALPHAS)} "
+              f"already done, {len(todo_native)} to run (max {N_PARALLEL_NATIVE} in parallel)", flush=True)
 
-    # --- merge-rna native, in parallel across whatever alphas aren't already checkpointed ---
-    todo_native = [a for a in ALPHAS if load_checkpoint('merge_rna', a) is None]
-    print(f"[{time.strftime('%H:%M:%S')}] merge-rna native: {len(ALPHAS) - len(todo_native)}/{len(ALPHAS)} "
-          f"already done, {len(todo_native)} to run (max {N_PARALLEL_NATIVE} in parallel)", flush=True)
-
-    if todo_native:
-        t0 = time.time()
-        mp_ctx = multiprocessing.get_context('fork')
-        with ProcessPoolExecutor(max_workers=N_PARALLEL_NATIVE, mp_context=mp_ctx) as pool:
-            futures = {pool.submit(run_native_fit, a, exp, ctx['phys_only_guess_path']): a for a in todo_native}
-            for fut in as_completed(futures):
-                alpha = futures[fut]
-                _, lambda_sc, info = fut.result()
-                if lambda_sc is None:
-                    print(f"  WARNING: merge-rna native fit returned None at alpha={alpha:.4g}: {info['message']}", flush=True)
-                    result = dict(lambda_sc=None, bpp=None, mut_rate_model=None,
-                                  log_likelihood=None, kl_divergence=None, total_loss=None, **info)
-                else:
-                    result = score(ctx, lambda_sc, alpha, info)
-                save_checkpoint('merge_rna', alpha, result)
-                print(f"  [{time.strftime('%H:%M:%S')}] native alpha={alpha:.4g} done: "
-                      f"success={info['success']} nit={info['nit']} grad_norm={info['grad_norm']}", flush=True)
-        print(f"[{time.strftime('%H:%M:%S')}] merge-rna native leg: {time.time() - t0:.1f}s "
-              f"for {len(todo_native)} alphas ({N_PARALLEL_NATIVE} parallel workers)", flush=True)
+        if todo_native:
+            t0 = time.time()
+            mp_ctx = multiprocessing.get_context('fork')
+            with ProcessPoolExecutor(max_workers=N_PARALLEL_NATIVE, mp_context=mp_ctx) as pool:
+                futures = {pool.submit(run_native_fit, a, exp, ctx['phys_only_guess_path']): a for a in todo_native}
+                for fut in as_completed(futures):
+                    alpha = futures[fut]
+                    _, lambda_sc, info = fut.result()
+                    if lambda_sc is None:
+                        print(f"  WARNING: merge-rna native fit returned None at alpha={alpha:.4g}: {info['message']}", flush=True)
+                        result = dict(lambda_sc=None, bpp=None, mut_rate_model=None,
+                                      log_likelihood=None, kl_divergence=None, total_loss=None, **info)
+                    else:
+                        result = score(ctx, lambda_sc, alpha, info)
+                    save_checkpoint('merge_rna', alpha, result)
+                    print(f"  [{time.strftime('%H:%M:%S')}] native alpha={alpha:.4g} done: "
+                          f"success={info['success']} nit={info['nit']} grad_norm={info['grad_norm']}", flush=True)
+            print(f"[{time.strftime('%H:%M:%S')}] merge-rna native leg: {time.time() - t0:.1f}s "
+                  f"for {len(todo_native)} alphas ({N_PARALLEL_NATIVE} parallel workers)", flush=True)
+        else:
+            print(f"[{time.strftime('%H:%M:%S')}] merge-rna native: nothing to do, all checkpointed.", flush=True)
     else:
-        print(f"[{time.strftime('%H:%M:%S')}] merge-rna native: nothing to do, all checkpointed.", flush=True)
+        print(f"[{time.strftime('%H:%M:%S')}] Skipping merge-rna native leg (RUN_MERGE_RNA=False).", flush=True)
 
     # --- maxent (chi-squared) and maxent (binomial), serial, resumable per-alpha ---
     mutation_counts = exp.df['mut_count'].values.astype(float)
     trials_counts = exp.df['total_count'].values.astype(float)
     a_i, b_i, penalty = ctx['a_i'], ctx['b_i'], ctx['penalty']
+    maxent_boundaries = bounds_array_with_mask(exp.N_seq, CUSTOM_MASK, bounds_sc_tuple[1])
 
     t0 = time.time()
     n_done = 0
@@ -497,13 +578,13 @@ def run_scan():
         if load_checkpoint('maxent_chi2', alpha) is None:
             bpp_target, sigma_squared = compute_expansion_parameters(mutation_counts, trials_counts, a_i, b_i)
             res_chi2 = maxent(exp.seq, bpp_target, sigma_squared=sigma_squared, penalty=penalty,
-                              boundaries=bounds_sc_tuple[1], alpha=alpha, T=ctx['exp_fit'].temp_C)[0]
+                              boundaries=maxent_boundaries, alpha=alpha, T=ctx['exp_fit'].temp_C)[0]
             save_checkpoint('maxent_chi2', alpha, score(ctx, res_chi2.x, alpha, opt_info_from_result(res_chi2)))
             n_done += 1
 
         if load_checkpoint('maxent_binomial', alpha) is None:
             res_binom = maxent_binomial(exp.seq, mutation_counts=mutation_counts, trials_counts=trials_counts,
-                                         a_phys=a_i, b_phys=b_i, penalty=penalty, boundaries=bounds_sc_tuple[1],
+                                         a_phys=a_i, b_phys=b_i, penalty=penalty, boundaries=maxent_boundaries,
                                          alpha=alpha, T=ctx['exp_fit'].temp_C)[0]
             save_checkpoint('maxent_binomial', alpha, score(ctx, res_binom.x, alpha, opt_info_from_result(res_binom)))
             n_done += 1
@@ -512,13 +593,21 @@ def run_scan():
 
     print(f"[{time.strftime('%H:%M:%S')}] maxent legs: {time.time() - t0:.1f}s ({n_done} new checkpoints)", flush=True)
     print(f"[{time.strftime('%H:%M:%S')}] Scan complete.", flush=True)
+    return ctx
 
 
-def assemble_results():
+def count_lambda_at_boundary(lambda_sc, mask, bound_abs, atol=1e-6):
+    if lambda_sc is None:
+        return None
+    active = lambda_sc[mask] if mask is not None else lambda_sc
+    return int(np.sum(np.isclose(np.abs(active), bound_abs, atol=atol)))
+
+
+def assemble_results(ctx=None):
     '''Reads whatever checkpoints exist (complete or partial scan) and writes the summary
     CSV/status CSV/pickle/plot. Safe to call at any time, including while the scan is still running.'''
     fitted_results = {}
-    for method in METHOD_LABELS:
+    for method in ACTIVE_METHODS:
         for alpha in ALPHAS:
             res = load_checkpoint(method, alpha)
             if res is not None:
@@ -528,9 +617,20 @@ def assemble_results():
         print("No checkpoints found yet.")
         return
 
+    if ctx is None:
+        ctx = build_shared_context()
+
+    # Re-score every checkpoint against the current ctx/masking rather than trusting
+    # whatever log_likelihood/kl_divergence/total_loss/bpp/mut_rate_model were cached at
+    # original fit time -- otherwise a scoring/masking fix never takes effect for
+    # already-checkpointed (method, alpha) pairs under --assemble-only.
+    fitted_results = {(method, alpha): rescore_checkpoint(ctx, res, alpha)
+                       for (method, alpha), res in fitted_results.items()}
+
     status_df = pd.DataFrame([
         dict(method=method, alpha=alpha, success=res['success'], status=res['status'],
-             message=res['message'], nit=res['nit'], grad_norm=res['grad_norm'])
+             message=res['message'], nit=res['nit'], grad_norm=res['grad_norm'],
+             n_lambda_at_boundary=count_lambda_at_boundary(res['lambda_sc'], CUSTOM_MASK, bounds_sc_tuple[1]))
         for (method, alpha), res in fitted_results.items()
     ]).sort_values(['method', 'alpha'])
 
@@ -549,7 +649,7 @@ def assemble_results():
     with open(os.path.join(OUTPUT_DIR, 'fitted_results.pkl'), 'wb') as f:
         pickle.dump(fitted_results, f)
 
-    n_expected = len(ALPHAS) * len(METHOD_LABELS)
+    n_expected = len(ALPHAS) * len(ACTIVE_METHODS)
     n_have = len(fitted_results)
     n_failed = int((~status_df['success']).sum())
     print(f"{n_have}/{n_expected} (method, alpha) checkpoints present ({n_failed} did not report success=True)")
@@ -559,7 +659,7 @@ def assemble_results():
         metrics = ['log_likelihood', 'kl_divergence', 'total_loss']
         titles = ['Log-likelihood', 'KL divergence', 'Total loss (NLL + alpha * KL)']
         for ax, metric, title in zip(axes, metrics, titles):
-            for method, label in METHOD_LABELS.items():
+            for method, label in ACTIVE_METHODS.items():
                 sub = summary_df[summary_df['method'] == method].sort_values('alpha')
                 if not sub.empty:
                     ax.plot(sub['alpha'], sub[metric], 'o-', label=label)
@@ -578,6 +678,56 @@ def assemble_results():
     print(f"Saved status to {os.path.join(OUTPUT_DIR, 'status_results.csv')}")
     print(f"Saved fitted results to {os.path.join(OUTPUT_DIR, 'fitted_results.pkl')}")
 
+    # --- Holdout analysis: log-likelihood on masked-out sites / all sites, vs. the
+    # lambda_sc=0 baseline evaluated on the same site subsets ---
+    exp_fit = ctx['exp_fit']
+    full_mask = np.ones(exp_fit.N_seq, dtype=bool)
+    held_out_mask = ~CUSTOM_MASK if CUSTOM_MASK is not None else None
+
+    mut_rate_zero = mut_rate_model_for_lambda(ctx, np.zeros(exp_fit.N_seq))
+    ll_zero_all = log_likelihood_on_mask(exp_fit, mut_rate_zero, full_mask)
+    ll_zero_masked_out = (log_likelihood_on_mask(exp_fit, mut_rate_zero, held_out_mask)
+                           if held_out_mask is not None else None)
+
+    holdout_rows = []
+    for (method, alpha), res in fitted_results.items():
+        if res['lambda_sc'] is None:
+            continue
+        mut_rate_model = res['mut_rate_model']
+        row = dict(method=method, alpha=alpha,
+                   log_likelihood_all_sites=log_likelihood_on_mask(exp_fit, mut_rate_model, full_mask))
+        if held_out_mask is not None:
+            row['log_likelihood_masked_out'] = log_likelihood_on_mask(exp_fit, mut_rate_model, held_out_mask)
+        holdout_rows.append(row)
+    holdout_df = pd.DataFrame(holdout_rows).sort_values(['method', 'alpha']) if holdout_rows else pd.DataFrame()
+
+    holdout_df.to_csv(os.path.join(OUTPUT_DIR, 'holdout_results.csv'), index=False)
+    print(f"Saved holdout results to {os.path.join(OUTPUT_DIR, 'holdout_results.csv')}")
+
+    if not holdout_df.empty:
+        panels = ([('log_likelihood_masked_out', 'Log-likelihood (masked-out sites)', ll_zero_masked_out)]
+                   if held_out_mask is not None else []) + \
+                 [('log_likelihood_all_sites', 'Log-likelihood (all sites)', ll_zero_all)]
+        fig, axes = plt.subplots(1, len(panels), figsize=(9 * len(panels), 5), squeeze=False)
+        axes = axes[0]
+        for ax, (metric, title, baseline) in zip(axes, panels):
+            for method, label in ACTIVE_METHODS.items():
+                sub = holdout_df[holdout_df['method'] == method].sort_values('alpha')
+                if not sub.empty:
+                    ax.plot(sub['alpha'], sub[metric]/baseline, 'o-', label=label)
+            # ax.axhline(baseline, linestyle='--', color='k', label='lambda_sc = 0 baseline')
+            ax.set_xscale('symlog', linthresh=1e-2)
+            ax.set_xlabel('alpha')
+            ax.set_ylabel(metric)
+            ax.set_title('relative ' + title)
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=8)
+        plt.tight_layout()
+        holdout_plot_path = os.path.join(OUTPUT_DIR, 'holdout_plot.png')
+        plt.savefig(holdout_plot_path, dpi=120)
+        print(f"Saved holdout plot to {holdout_plot_path}")
+
+# %%
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -588,5 +738,5 @@ if __name__ == '__main__':
     if args.assemble_only:
         assemble_results()
     else:
-        run_scan()
-        assemble_results()
+        ctx = run_scan()
+        assemble_results(ctx)
