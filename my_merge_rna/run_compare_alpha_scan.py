@@ -26,6 +26,7 @@ status_results.csv / fitted_results.pkl / scan_plot.png, and exits immediately (
 """
 import os
 import sys
+import json
 import time
 import pickle
 import argparse
@@ -61,7 +62,8 @@ COVERAGE = 10000
 SEED = 42  # fixes the one binomial draw used across the whole scan
 SEED_VAL = 43  # fixes the one binomial draw used for validation
 
-ALPHAS = np.concatenate([[0.0], np.logspace(-2, 3, 21)])  # 0.01 ... 1000, ~4/decade
+# ALPHAS = np.concatenate([[0.0], np.logspace(-2, 3, 21)])  # 0.01 ... 1000, ~4/decade
+ALPHAS = np.concatenate([np.logspace(-2, 3, 21),  np.logspace(3,6,7)]) # 0.01 ... 1000, ~4/decade
 
 # Measured: one merge-rna native lambda_only fit with default (uncapped) tolerances took ~60 min
 # (562 L-BFGS-B iterations x ~6.4s/iteration, on this 148-nt sequence). MAX_ITER bounds that cost;
@@ -72,7 +74,7 @@ bounds_sc_tuple = (-5.,5.)
 
 N_PARALLEL_NATIVE = 8  # out of 20 cores on this shared machine -- leaves headroom for other users
 
-subfix_out = '30pcmask_nomerge'
+subfix_out = 'halfmask_test'
 OUTPUT_DIR = os.path.join('fits_paper', 'designed_sequence', 'outputs', 'compare_alpha_scan_pop80_' + subfix_out)
 CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, 'checkpoints')
 
@@ -82,12 +84,13 @@ METHOD_LABELS = {
     'maxent_binomial': 'maxent (binomial)',
 }
 
-RUN_MERGE_RNA = False   # set to True to re-enable the native merge-rna fits
-ACTIVE_METHODS = {k: v for k, v in METHOD_LABELS.items() if (RUN_MERGE_RNA or k != 'merge_rna')}
+RUN_MERGE_RNA = True   # set to True to re-enable the native merge-rna fits
+RUN_MAXENT_BINOMIAL = True  # set to True to re-enable the maxent binomial fits
+ACTIVE_METHODS = {k: v for k, v in METHOD_LABELS.items() if k=='maxent_chi2' or (RUN_MERGE_RNA and k == 'merge_rna') or (RUN_MAXENT_BINOMIAL and k == 'maxent_binomial')}
 
 len_seq = 148  # length of the designed sequence used in this scan
-#CUSTOM_MASK = np.concatenate([np.ones(len_seq//2, dtype=bool), np.zeros(len_seq//2, dtype=bool)])
-CUSTOM_MASK = np.concatenate([np.ones(50, dtype=bool), np.zeros(45, dtype=bool), np.ones(len_seq - 50 - 45, dtype=bool)])  # mask directly as array of bools, script expects file or a string with 01
+CUSTOM_MASK = np.concatenate([np.ones(len_seq//2, dtype=bool), np.zeros(len_seq//2, dtype=bool)])
+#CUSTOM_MASK = np.concatenate([np.ones(50, dtype=bool), np.zeros(45, dtype=bool), np.ones(len_seq - 50 - 45, dtype=bool)])  # mask directly as array of bools, script expects file or a string with 01
 #CUSTOM_MASK = None  # no masking, all positions are free to be fit
 
 COVERAGE_FRACTION = 1.  # fraction of the total coverage to use for the synthetic data (for testing)
@@ -116,7 +119,7 @@ def save_checkpoint(method, alpha, result):
 # =============================================================================
 def compute_expansion_parameters(z, T, a, b):
     target_contact_prob = (z - T * a) / (T * b)
-    squared_confidence_interval = ((T - z) / T) * (z / T**2) / b**2
+    squared_confidence_interval = np.where(z>0,((T - z) / T) * (z / T**2) / b**2, T*(b**2))
     return target_contact_prob, squared_confidence_interval
 
 
@@ -130,7 +133,7 @@ def bounds_array_with_mask(n_seq, mask, bound_abs):
     return boundaries
 
 
-def maxent(seq,bpp_ref,*, sigma_squared, penalty=None, boundaries=None, initial_guess=None, rescale=True,version=0,T=None,deriv_correct=False,alpha=0.0,tol=None):
+def maxent(seq,bpp_ref,*, sigma_squared, penalty=None, boundaries=None, natural_boundaries=False, initial_guess=None, rescale=True,version=0,T=None,deriv_correct=False,alpha=0.0,tol=None):
     # seq: sequence
     # bpp_ref: array with base pairing probabilities to be enforced
     # sigma_squared error estimate, enters in derivative and regularization
@@ -154,10 +157,18 @@ def maxent(seq,bpp_ref,*, sigma_squared, penalty=None, boundaries=None, initial_
     if rescale:
         fc.mfe()
         fc.exp_params_rescale(1.*fc.mfe()[1])
-    
-    if isinstance(boundaries,float) or isinstance(boundaries,int):
-        boundaries=boundaries*np.ones((len(seq),2))
-        boundaries[:,0]*=-1
+
+    if natural_boundaries:
+        # natural boundaries are the ones that guarantee that the pairing probability is in [0,1]
+        # for a given a_phys, b_phys, and mutation counts
+        natural_min_lambda=-bpp_ref/(alpha*sigma_squared)
+        natural_max_lambda=(1-bpp_ref)/(alpha*sigma_squared)
+        boundaries = np.array([(natural_min_lambda[i], natural_max_lambda[i]) for i in range(len(natural_min_lambda))])
+        boundaries = boundaries/(beta*alpha)  # make adimensional for the optimizer
+    else:
+        if isinstance(boundaries,float) or isinstance(boundaries,int):
+            boundaries=boundaries*np.ones((len(seq),2))
+            boundaries[:,0]*=-1
     
     def Gamma(lambdas):
         
@@ -223,7 +234,9 @@ def maxent(seq,bpp_ref,*, sigma_squared, penalty=None, boundaries=None, initial_
     return res,bpp_ref-res.jac+alpha*beta*sigma_squared*res.x
 
 
-def maxent_binomial(seq, mutation_counts, trials_counts, a_phys, b_phys,*, penalty=None, boundaries=None, initial_guess=None, rescale=True,version=0,T=None,deriv_correction=False,alpha=0.0,tol=None):
+def maxent_binomial(seq, mutation_counts, trials_counts, a_phys, b_phys,*, penalty=None, 
+                    boundaries=None, formal_bounds=True, initial_guess=None, mask=None,
+                    rescale=True,version=0,T=None,deriv_correction=False,alpha=0.0,tol=None):
     # seq: sequence
     # mutation_counts: array with number of mutations counted per site
     # trials_counts: array with number of attempted mutations per site
@@ -251,12 +264,37 @@ def maxent_binomial(seq, mutation_counts, trials_counts, a_phys, b_phys,*, penal
         fc.mfe()
         fc.exp_params_rescale(1.*fc.mfe()[1])
 
+    if mask is None:
+        mask=np.ones(len(seq),dtype=bool)
+
+    positions_with_zero_mut=np.zeros(len(seq),dtype=bool)
+    positions_with_nonzero_mut=np.zeros(len(seq),dtype=bool)
+
+    for i in range(len(seq)):
+        if mask[i]:
+            if mutation_counts[i]==0:
+                positions_with_zero_mut[i]=True
+            elif mutation_counts[i]>0:
+                positions_with_nonzero_mut[i]=True
 
     if isinstance(boundaries,float) or isinstance(boundaries,int):
         boundaries=boundaries*np.ones((len(seq),2))
         boundaries[:,0]*=-1
     elif boundaries is None:
         boundaries = np.array([(None, None)]*len(seq))
+
+    # when a mutation count is zero, the likelihood has a behavior that requires a lower bound on the sc
+    if formal_bounds:
+        for i in range(len(seq)):
+            if positions_with_zero_mut[i]:
+                # if trials_counts[i]*b_phys[i]/alpha <boundaries[i,1] or boundaries[i,1] is None:  # this has a problem if one imposes a lower bound that is already higher than the natural bound
+                #     boundaries[i,0]=trials_counts[i]*b_phys[i]/alpha
+                # else:
+                #     boundaries[i,0]=trials_counts[i]*b_phys[i]/alpha # this has to be set always otherwise you get mut_prob<0 easily for small lambdas
+                #     boundaries[i,1]=trials_counts[i]*b_phys[i]/alpha
+                #     # alternatively one could set both bounds to the "natural" one, but it could be too large
+                boundaries[i,0]=trials_counts[i]*b_phys[i]/(alpha*(1-a_phys[i]))
+                boundaries[i,1]=trials_counts[i]*b_phys[i]/(alpha*(1-a_phys[i]-b_phys[i])) 
 
     frac_phys = a_phys/b_phys
     inv_b_phys = 1.0/b_phys
@@ -265,14 +303,23 @@ def maxent_binomial(seq, mutation_counts, trials_counts, a_phys, b_phys,*, penal
         # lams must be adimensional
         # when lams is 0 (or alpha is 0), the results should be -frac_phys + inv_b_phys*mutation_counts/trials_counts
         lams_prime = lams*alpha/b_phys
-        S = np.sqrt((trials_counts - lams_prime)**2 + 4*mutation_counts*lams_prime)
-        result =  -frac_phys + inv_b_phys*2*mutation_counts / (S - (lams_prime - trials_counts))
-        #print(result-(-frac_phys+inv_b_phys*mutation_counts/trials_counts))
+        zero_vec = np.zeros_like(lams)
+
+        # when mutation_counts=0, the result should be -frac_phys + inv_b_phys - T/(lambda*alpha)
+        S = np.sqrt((trials_counts - lams_prime)**2 + 4*mutation_counts*lams_prime, out=zero_vec, where=(mutation_counts>0))
+
+        result = np.where(positions_with_zero_mut, -frac_phys + inv_b_phys-trials_counts/(alpha*lams), zero_vec)
+        result =  np.where(positions_with_nonzero_mut, -frac_phys + inv_b_phys*2*mutation_counts / (S - (lams_prime - trials_counts)), result)
+
         return result
 
     def loss_binomial(bpp_1):
         mut_prob = a_phys+b_phys*bpp_1
-        return -mutation_counts*np.log(mut_prob)-(trials_counts-mutation_counts)*np.log(1-mut_prob)
+        log_mut = np.zeros_like(mut_prob)
+        log_1m_mut = np.zeros_like(mut_prob)
+        np.log(mut_prob, out=log_mut, where=(positions_with_zero_mut))
+        np.log(1-mut_prob, out=log_1m_mut, where=(positions_with_nonzero_mut)) # one should also check if z != T
+        return -mutation_counts*log_mut-(trials_counts-mutation_counts)*log_1m_mut
     
     def deriv_loss_binomial(bpp_1):
         mut_prob = a_phys+b_phys*bpp_1
@@ -335,6 +382,7 @@ def maxent_binomial(seq, mutation_counts, trials_counts, a_phys, b_phys,*, penal
     
     if initial_guess is None:
         initial_guess=np.zeros(len(seq))
+        # the minimize handles init guess out of boundaries
     else:
         initial_guess=np.array(initial_guess)
     
@@ -354,8 +402,11 @@ def maxent_binomial(seq, mutation_counts, trials_counts, a_phys, b_phys,*, penal
 # =============================================================================
 # Shared setup (physical params, synthetic data, scoring)
 # =============================================================================
-def build_shared_context():
-    params_1D_ref = np.loadtxt(PARAMS1D_PATH)[:8]
+def load_reference_physical_params(params_1d_path):
+    """Bootstrap mu_r/p_b/m0/m1/p_bind_dict from an 8-value physical-params file, via a
+    throwaway 0mM Redmond reference system (this bootstrap doesn't depend on which
+    experiment will actually be fit/scored)."""
+    params_1D_ref = np.loadtxt(params_1d_path)[:8]
 
     exp_ref_0mM = next(
         (Experiment(p) for p in Experiment.paths_to_redmond_ivt_data_txt if Experiment(p).conc_mM == 0),
@@ -368,33 +419,48 @@ def build_shared_context():
 
     mu_r, p_b, m0, m1 = (params_dict_ref['mu_r'], params_dict_ref['p_b'],
                          params_dict_ref['m0'], params_dict_ref['m1'])
-    p_bind_dict = params_dict_ref['p_bind']
+    return params_1D_ref, params_dict_ref, mu_r, p_b, m0, m1, params_dict_ref['p_bind']
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    phys_only_guess_path = os.path.join(OUTPUT_DIR, 'phys_params_only.txt')
-    np.savetxt(phys_only_guess_path, params_1D_ref)
 
-    np.random.seed(SEED)
+def save_experiment(exp, path_prefix):
+    """Save exp.df + reload metadata so Experiment.from_csv(f'{path_prefix}_df.csv', **json.load(...))
+    reconstructs it later, from any script."""
+    exp.df.to_csv(f'{path_prefix}_df.csv', index=False)
+    meta = dict(system_name=exp.system_name, conc_mM=exp.conc_mM, temp_C=exp.temp_C,
+                reagent=exp.reagent, rep_number=exp.rep_number)
+    with open(f'{path_prefix}_meta.json', 'w') as f:
+        json.dump(meta, f)
 
-    if COVERAGE_FRACTION < 1.0:
-        fit_coverage = int(COVERAGE_FRACTION * COVERAGE)
-        valid_coverage = COVERAGE - fit_coverage
 
-        exp = create_exp_synthetic_comb(pop1=POP1, params_dict=params_dict_ref, noise=True, coverage=fit_coverage)
+def save_mask(mask, path):
+    """'0'/'1' string -- the exact format ExperimentFit._parse_custom_mask accepts as custom_mask=path."""
+    with open(path, 'w') as f:
+        f.write(''.join('1' if b else '0' for b in mask))
 
-        np.random.seed(SEED_VAL)
-        valid_exp = create_exp_synthetic_comb(pop1=POP1, params_dict=params_dict_ref, noise=True, coverage=valid_coverage)
 
-    else:
-        exp = create_exp_synthetic_comb(pop1=POP1, params_dict=params_dict_ref, noise=True, coverage=COVERAGE)
-        valid_exp = None
+def combine_experiments(exp_a, exp_b, *, system_name='combined'):
+    """Pool mut_count/total_count position-wise from two experiments of the SAME sequence into
+    one merged Experiment -- used when there's no position mask to split trained/held-out on."""
+    if exp_a.seq != exp_b.seq:
+        raise ValueError(f"Cannot combine experiments with different sequences "
+                          f"({exp_a.system_name!r} vs {exp_b.system_name!r})")
+    if exp_a.conc_mM != exp_b.conc_mM:
+        raise ValueError(f"Cannot combine experiments at different concentrations "
+                          f"({exp_a.conc_mM!r} mM vs {exp_b.conc_mM!r} mM)")
+    df = exp_a.df.copy()
+    df['mut_count'] = exp_a.df['mut_count'].values + exp_b.df['mut_count'].values
+    df['total_count'] = exp_a.df['total_count'].values + exp_b.df['total_count'].values
+    df['wt_count'] = df['total_count'] - df['mut_count']
+    df['mut_rate'] = df['mut_count'] / df['total_count']
+    return Experiment.from_dataframe(df, seq=exp_a.seq, system_name=system_name, conc_mM=exp_a.conc_mM)
 
-    exp.df.to_csv(os.path.join(OUTPUT_DIR, 'synthetic_exp_df.csv'), index=False)
-    if valid_exp is not None:
-        valid_exp.df.to_csv(os.path.join(OUTPUT_DIR, 'synthetic_valid_exp_df.csv'), index=False)
 
-    multi_score = MultiSystemsFit(experiments=[exp], validation_exps=None, infer_1D_sc=True,
-                                   skip_output_setup=True, custom_mask=CUSTOM_MASK)
+def build_scoring_context(experiments, mu_r, p_b, m0, m1, p_bind_dict, mask=None):
+    """Scores/fits-shared setup for a given experiment list/mask -- generalizes what used to be
+    build_shared_context()'s tail so it can also be reused to score a NEW experiment, not just
+    the one being fit."""
+    multi_score = MultiSystemsFit(experiments=experiments, validation_exps=None, infer_1D_sc=True,
+                                   skip_output_setup=True, custom_mask=mask)
     exp_fit = multi_score.systems[0].exp_fits_train[0]
 
     mu_j = mu_r + exp_fit.kBT * np.log((exp_fit.conc_mM + .1) / 1000) if exp_fit.conc_mM is not None else mu_r
@@ -416,10 +482,42 @@ def build_shared_context():
     assert np.allclose(mut_rate_direct, mut_rate_affine, atol=1e-10), \
         "a_i, b_i do not exactly reproduce merge-rna's affine mutation-rate model"
 
-    return dict(params_dict_ref=params_dict_ref, mu_r=mu_r, p_b=p_b, m0=m0, m1=m1,
-                p_bind_dict=p_bind_dict, phys_only_guess_path=phys_only_guess_path,
-                exp=exp, valid_exp=valid_exp, multi_score=multi_score, exp_fit=exp_fit, mu_j=mu_j,
-                penalty=penalty, a_i=a_i, b_i=b_i)
+    return dict(mu_r=mu_r, p_b=p_b, m0=m0, m1=m1, p_bind_dict=p_bind_dict,
+                multi_score=multi_score, exp_fit=exp_fit, mu_j=mu_j, penalty=penalty, a_i=a_i, b_i=b_i)
+
+
+def build_shared_context():
+    params_1D_ref, params_dict_ref, mu_r, p_b, m0, m1, p_bind_dict = load_reference_physical_params(PARAMS1D_PATH)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    phys_only_guess_path = os.path.join(OUTPUT_DIR, 'phys_params_only.txt')
+    np.savetxt(phys_only_guess_path, params_1D_ref)
+
+    np.random.seed(SEED)
+
+    if COVERAGE_FRACTION < 1.0:
+        fit_coverage = int(COVERAGE_FRACTION * COVERAGE)
+        valid_coverage = COVERAGE - fit_coverage
+
+        exp = create_exp_synthetic_comb(pop1=POP1, params_dict=params_dict_ref, noise=True, coverage=fit_coverage)
+
+        np.random.seed(SEED_VAL)
+        valid_exp = create_exp_synthetic_comb(pop1=POP1, params_dict=params_dict_ref, noise=True, coverage=valid_coverage)
+
+    else:
+        exp = create_exp_synthetic_comb(pop1=POP1, params_dict=params_dict_ref, noise=True, coverage=COVERAGE)
+        valid_exp = None
+
+    save_experiment(exp, os.path.join(OUTPUT_DIR, 'exp'))
+    if valid_exp is not None:
+        save_experiment(valid_exp, os.path.join(OUTPUT_DIR, 'valid_exp'))
+    if CUSTOM_MASK is not None:
+        save_mask(CUSTOM_MASK, os.path.join(OUTPUT_DIR, 'mask.txt'))
+
+    scoring_ctx = build_scoring_context([exp], mu_r, p_b, m0, m1, p_bind_dict, mask=CUSTOM_MASK)
+
+    return dict(params_dict_ref=params_dict_ref, phys_only_guess_path=phys_only_guess_path,
+                exp=exp, valid_exp=valid_exp, **scoring_ctx)
 
 
 def opt_info_from_result(res, param_indices=None):
@@ -572,6 +670,9 @@ def run_scan():
     a_i, b_i, penalty = ctx['a_i'], ctx['b_i'], ctx['penalty']
     maxent_boundaries = bounds_array_with_mask(exp.N_seq, CUSTOM_MASK, bounds_sc_tuple[1])
 
+    if not RUN_MAXENT_BINOMIAL:
+        print(f"[{time.strftime('%H:%M:%S')}] Skipping maxent (binomial) leg (RUN_MAXENT_BINOMIAL=False).", flush=True)
+
     t0 = time.time()
     n_done = 0
     for alpha in ALPHAS:
@@ -582,12 +683,13 @@ def run_scan():
             save_checkpoint('maxent_chi2', alpha, score(ctx, res_chi2.x, alpha, opt_info_from_result(res_chi2)))
             n_done += 1
 
-        if load_checkpoint('maxent_binomial', alpha) is None:
-            res_binom = maxent_binomial(exp.seq, mutation_counts=mutation_counts, trials_counts=trials_counts,
-                                         a_phys=a_i, b_phys=b_i, penalty=penalty, boundaries=maxent_boundaries,
-                                         alpha=alpha, T=ctx['exp_fit'].temp_C)[0]
-            save_checkpoint('maxent_binomial', alpha, score(ctx, res_binom.x, alpha, opt_info_from_result(res_binom)))
-            n_done += 1
+        if RUN_MAXENT_BINOMIAL:
+            if load_checkpoint('maxent_binomial', alpha) is None:
+                res_binom = maxent_binomial(exp.seq, mutation_counts=mutation_counts, trials_counts=trials_counts,
+                                                a_phys=a_i, b_phys=b_i, penalty=penalty, boundaries=maxent_boundaries,
+                                                alpha=alpha, T=ctx['exp_fit'].temp_C)[0]
+                save_checkpoint('maxent_binomial', alpha, score(ctx, res_binom.x, alpha, opt_info_from_result(res_binom)))
+                n_done += 1
 
         print(f"  [{time.strftime('%H:%M:%S')}] maxent alpha={alpha:.4g} done", flush=True)
 
