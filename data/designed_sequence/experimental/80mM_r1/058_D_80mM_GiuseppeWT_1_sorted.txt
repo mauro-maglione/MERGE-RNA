@@ -10,3 +10,5 @@ Path to full reference fasta:	/Users/giuseppesacco/uni/MERGE-RNA/Newseq/referenc
 Temperature:	37
 system:	NewseqWT
 Rep number:	1
+Total reads (rf-count paper flags):	236810
+Mutated reads (rf-count paper flags):	137811

@@ -158,6 +158,7 @@ def maxent(seq,bpp_ref,*, sigma_squared, penalty=None, boundaries=None, natural_
         fc.mfe()
         fc.exp_params_rescale(1.*fc.mfe()[1])
 
+    # oly thing modified for boundaries
     if natural_boundaries:
         # natural boundaries are the ones that guarantee that the pairing probability is in [0,1]
         # for a given a_phys, b_phys, and mutation counts
