@@ -119,11 +119,24 @@ lambda_sc = np.zeros(len(lambda_sc)) # for now, no soft constraints
 
 sample_number = 50000
 
-mol = bussi.Molecule(seq, lambdas1d=lambda_sc+penalty*np.ones(len(seq)))
+# mol = bussi.Molecule(seq, lambdas1d=lambda_sc+penalty*np.ones(len(seq)))
+
+bias = [[0,0],[0,-4]]
+mol_0 = bussi.Molecule(seq, state_positions=[[80,86],[46,52]],state_biases=[bias,bias])
+mat = mol_0.pairing_correlation_matrix()
+bpp = mol_0.base_pairing_probability()
+bpp=np.sum(bpp,axis=0)
+aver_mult = np.matmul(np.atleast_2d(bpp).T, np.atleast_2d(bpp))
+
+plt.plot(mol_0.base_pairing_probability().sum(1))
+
+plt.figure(figsize=(6, 5))
+plt.imshow(mat-aver_mult, cmap='bwr', vmin=-1, vmax=1)
+plt.colorbar(label='Pairing correlation')
 
 # %%
 
-sampled_states, logweights = bussi.sample_to_numpy(mol.sample(sample_number), deduplicate=False)
+sampled_states, logweights = bussi.sample_to_numpy(mol_0.sample(sample_number), deduplicate=False)
 # I do it in the stupidest way
 
 sampled_reaction_states = np.zeros(sampled_states.shape, dtype=int)
@@ -239,8 +252,6 @@ mutation_df = mutation_states_to_dataframe(sampled_mutation_states, sample_name=
 path_synthetic_data = os.path.join(os.environ['RNA_STRUCT_HOME'], 'data', 'designed_sequence', 'synthetic_mutation_experiments')
 os.makedirs(path_synthetic_data, exist_ok=True)
 mutation_df.to_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_r{REP_NUMBER}.csv"), index=False)
-
-
 
 # %%
 from merge_rna.experiment import load_rc, to_int, bytes_to_seq
