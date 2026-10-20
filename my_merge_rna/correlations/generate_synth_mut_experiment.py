@@ -108,6 +108,13 @@ def compute_mutation_probabilities(fit_struct, phase1_params):
 # %%
 p_reaction_given_unpaired_nb, p_reaction_given_paired_nb, a_i, b_i, penalty = compute_mutation_probabilities(fit_struct, phase1_params)
 
+# merge_rna fits only the positions inside position_mask (first/last 25 nt excluded): the model is not
+# constrained on the ends and overestimates their mutation rate, so they are treated as unobserved below.
+position_mask = fit_struct.systems[0].exp_fits_train[0].position_mask
+offset = exp.df.index.min()                     # kept index (exp.seq, synthetic) -> raw index (.mm file)
+lo, hi = np.where(position_mask)[0][[0, -1]]    # fitted window, kept indexing
+print(f"Fitted window: kept positions {lo}..{hi} (raw .mm {lo+offset}..{hi+offset})")
+
 # %%
 # =============================================================================
 # Extract reaction states
@@ -181,6 +188,10 @@ for i in range(sample_number):
         else:
             sampled_mutation_states[i,j] = np.random.binomial(1, 1-prob_fn[j]) # this needs the true positive probability
 
+sampled_mutation_states_full = sampled_mutation_states.copy()  # all positions, kept only for the diagnostics
+sampled_mutation_states[:, ~position_mask] = 0                  # unfitted ends: treat as unobserved
+sampled_reaction_states[:, ~position_mask] = 0
+
 # %%
 
 reaction_counts = sampled_reaction_states.sum(axis=1)
@@ -249,9 +260,13 @@ def mutation_states_to_dataframe(mutation_states, sample_name="synthetic"):
 
 mutation_df = mutation_states_to_dataframe(sampled_mutation_states, sample_name=f"synthetic_{CONC_MM}mM_r{REP_NUMBER}")
 
+# %%
+# save dataframe
 path_synthetic_data = os.path.join(os.environ['RNA_STRUCT_HOME'], 'data', 'designed_sequence', 'synthetic_mutation_experiments')
 os.makedirs(path_synthetic_data, exist_ok=True)
 mutation_df.to_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_r{REP_NUMBER}.csv"), index=False)
+# save the position mask (True = observed/fitted, kept indexing of exp.seq): masked positions carry no information
+np.save(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_r{REP_NUMBER}_mask.npy"), position_mask)
 
 # %%
 from merge_rna.experiment import load_rc, to_int, bytes_to_seq
@@ -281,18 +296,88 @@ assert mutated_reads == len(df), (
 sample['total_reads'] = total_reads
 sample['zero_mut_reads'] = total_reads - mutated_reads
 
+# count only the mutations inside the fitted window (same positions as the synthetic reads)
+df['mut_count_window'] = df['mut_positions'].apply(lambda p: int(np.sum((p >= lo + offset) & (p <= hi + offset))))
+
 fig, ax = plt.subplots(1, 1, figsize=(6 * 1, 4))
-df = sample['df']
-max_k = int(df['mut_count_per_read'].max())
-counts_mutated, _ = np.histogram(df['mut_count_per_read'], bins=range(1, max_k + 2))
-counts = np.concatenate(([sample['zero_mut_reads']], counts_mutated))
+max_k = int(df['mut_count_window'].max())
+counts_mutated, _ = np.histogram(df['mut_count_window'], bins=range(1, max_k + 2))
+counts = np.concatenate(([total_reads - np.sum(df['mut_count_window'] > 0)], counts_mutated))
 colors = ['0.7'] + ['tab:blue'] * max_k
 ax.bar(range(0, max_k + 1), counts, color=colors, edgecolor='black')
-ax.set_title(f"{sample['label']} (N={sample['total_reads']})")
-ax.set_xlabel('Mutations per read')
+ax.set_title(f"{sample['label']} (N={sample['total_reads']}), fitted window")
+ax.set_xlabel('Mutations per read (fitted window)')
 ax.set_ylabel('Number of reads')
-ax.legend(handles=[Patch(color='0.7', label='k=0 (info.txt: total - mutated)'),
+ax.legend(handles=[Patch(color='0.7', label='k=0 (info.txt total - reads mutated in window)'),
                     Patch(color='tab:blue', label='k>=1 (.mm file)')], fontsize=8)
+fig.tight_layout()
+
+# %%
+# =============================================================================
+# Synthetic vs real: where they differ
+# =============================================================================
+# Note: .mm positions are raw indices, synthetic/exp.seq positions are kept indices; raw = kept + offset.
+
+# 1) per-site mutation rates: the model overestimates only on the masked (unfitted) ends
+model_rate = a_i + b_i * bpp                    # M_i = a_i + b_i <s_i>, generating ensemble (mol_0)
+data_rate = exp.df['mut_rate'].values
+synth_rate = sampled_mutation_states_full.mean(axis=0)
+
+fig, ax = plt.subplots(figsize=(15, 5))
+ax.plot(data_rate, 'k.-', label='data (rc)')
+ax.plot(model_rate, 'r-', label='model $a_i+b_i\\langle s_i\\rangle$')
+ax.plot(synth_rate, 'b.', alpha=0.6, label='synthetic (before masking)')
+ax.axvspan(-0.5, lo - 0.5, color='0.85', zorder=0, label='masked in merge_rna fit')
+ax.axvspan(hi + 0.5, len(seq) - 0.5, color='0.85', zorder=0)
+ax.set_xlabel('Position (kept index)')
+ax.set_ylabel('Mutation rate')
+ax.legend()
+fig.tight_layout()
+
+# 2) summary: mean mutations per read, P(k=0) and E[k|k>=1]
+k_synth_full = sampled_mutation_states_full.sum(axis=1)
+k_synth = sampled_mutation_states.sum(axis=1)
+k_real = df['mut_count_window'].values          # mutated reads only; zeros come from total_reads
+spanning = (df['read_start'] <= lo + offset) & (df['read_end'] >= hi + offset)
+k_real_span = k_real[spanning.values & (k_real > 0)]
+all_real_positions = np.concatenate(df["mut_positions"].values)
+n_real_mut_full = np.sum((all_real_positions >= offset) & (all_real_positions < offset + len(seq)))
+
+print(f"{'':32s}{'all 130 nt':>12s}{'fitted window':>15s}")
+print(f"{'mean muts/read  model sum M_i':32s}{model_rate.sum():12.3f}{model_rate[position_mask].sum():15.3f}")
+print(f"{'                data sum rate':32s}{data_rate.sum():12.3f}{data_rate[position_mask].sum():15.3f}")
+print(f"{'                synthetic':32s}{k_synth_full.mean():12.3f}{k_synth.mean():15.3f}")
+print(f"{'                real (.mm/total)':32s}{n_real_mut_full/total_reads:12.3f}{k_real.sum()/total_reads:15.3f}")
+print(f"{'P(k=0)          synthetic':32s}{np.mean(k_synth_full == 0):12.3f}{np.mean(k_synth == 0):15.3f}")
+print(f"{'                real (approx.)':32s}{sample['zero_mut_reads']/total_reads:12.3f}{1 - np.sum(k_real > 0)/total_reads:15.3f}")
+print(f"{'E[k|k>=1]       synthetic':32s}{k_synth_full[k_synth_full > 0].mean():12.3f}{k_synth[k_synth > 0].mean():15.3f}")
+print(f"{'                real (spanning)':32s}{'':12s}{k_real_span.mean():15.3f}")
+
+# 3) P(k|k>=1) in the window: real reads are overdispersed wrt synthetic and factorized model
+def poisson_binomial(probs):
+    """Distribution of the number of successes of independent Bernoulli trials."""
+    dist = np.array([1.])
+    for p in probs:
+        dist = np.convolve(dist, [1 - p, p])
+    return dist
+
+pk_factorized = poisson_binomial(model_rate[position_mask])   # mergeRNA-like, no correlations
+
+kmax = int(max(k_real_span.max(), k_synth.max()))
+ks = np.arange(1, kmax + 1)
+pk_real = np.array([np.mean(k_real_span == k) for k in ks])
+pk_synth = np.array([np.mean(k_synth[k_synth > 0] == k) for k in ks])
+pk_fact = pk_factorized[1:kmax + 1] / pk_factorized[1:].sum()
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.plot(ks, pk_real, 'ko-', label='real (reads spanning window)')
+ax.plot(ks, pk_synth, 'bs-', label='synthetic')
+ax.plot(ks, pk_fact, 'r^--', label='factorized (independent sites)')
+ax.set_yscale('log')
+ax.set_ylim(bottom=0.5 / len(k_real_span))     # resolution of the real data
+ax.set_xlabel('Mutations per read in fitted window, k')
+ax.set_ylabel('P(k | k >= 1)')
+ax.legend()
 fig.tight_layout()
 
 

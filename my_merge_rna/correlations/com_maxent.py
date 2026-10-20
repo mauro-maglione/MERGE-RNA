@@ -147,11 +147,15 @@ def forward_model_fixed_params(states, a_i, b_i, mask = None):
         
     return mutation_probs
 
-def forward_model(reads, N_reads, logweights, logweights_0, mutation_probs):
-    """Compute loss and derivatives approximately using ensemble of suboptimal structures."""
+def forward_model(reads, N_reads, logweights, logweights_0, mutation_probs, mask = None):
+    """Compute loss and derivatives approximately using ensemble of suboptimal structures.
+    Masked positions (mask False) are unobserved: they contribute a factor 1 to every read."""
 
     # I'm assuming that reads comes in a form that has a the mutated sites -
     # - in reads and the number of reads with these mutations in N_reads
+    if mask is None:
+        mask = np.ones(mutation_probs.shape[1], bool)
+    observed_sites = set(np.where(mask)[0])
 
     normalization = np.sum(np.exp(logweights))
     log_normalization = np.log(normalization)
@@ -166,15 +170,16 @@ def forward_model(reads, N_reads, logweights, logweights_0, mutation_probs):
         for s in range(mutation_probs.shape[0]):
             mut_prob_per_struct = 1.
             for mut_site in reads[r]:
-                mut_prob_per_struct *= mutation_probs[s,mut_site]
+                if mask[mut_site]:
+                    mut_prob_per_struct *= mutation_probs[s,mut_site]
 
-            for non_mut_site in set(range(mutation_probs.shape[1])) - set(reads[r]):
+            for non_mut_site in observed_sites - set(reads[r]):
                 mut_prob_per_struct *= (1-mutation_probs[s,non_mut_site])
 
-            read_likelihood += np.exp(logweights[s]) * mut_prob_per_struct
+            read_likelihood += np.exp(logweights[s] - log_normalization) * mut_prob_per_struct   
 
             der_read_likelihood[s] += mut_prob_per_struct * np.exp(logweights_0[s]-log_normalization)
-            der_read_likelihood += - mut_prob_per_struct * np.exp(logweights_0+(logweights_0[s]-2*log_normalization)*np.ones(len(logweights),float))
+            der_read_likelihood += - mut_prob_per_struct * np.exp(logweights_0 + logweights[s] - 2*log_normalization) 
 
         # i'm considering a negative log likelihood
 
@@ -192,13 +197,18 @@ print(f"The minimum free energy is {min_free_en} and the total one {tot_free_en}
 
 # %%
 # delta 10 -> 145625 struct, 0.998 coverage, delta 5 -> 815 struct, 0.944 coverage
-delta_kcalpermol = 5
+delta_kcalpermol = 4
 coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol)
 
 # %%
-mutation_matrix = forward_model_fixed_params(states, a_i, b_i)
+path_synthetic_data = os.path.join(os.environ['RNA_STRUCT_HOME'], 'data', 'designed_sequence', 'synthetic_mutation_experiments')
+df = pd.read_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_r{REP_NUMBER}.csv"))
+# mask saved by generate_synth_mut_experiment.py (True = observed/fitted position, kept indexing of exp.seq)
+position_mask = np.load(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_r{REP_NUMBER}_mask.npy"))
+assert len(position_mask) == len(seq), f"mask length {len(position_mask)} != sequence length {len(seq)}"
 
-df = pd.read_csv('/u/m/mmaglion/Documents/MERGE-RNA_restored/data/designed_sequence/synthetic_mutation_experiments/synthetic_80mM_r1.csv')
+mutation_matrix = forward_model_fixed_params(states, a_i, b_i, mask=position_mask)
+
 reads_str = df['mut_positions'].values
 reads_int_list = [ast.literal_eval(read) for read in reads_str]
 N_reads = df['occurrences'].values
@@ -207,5 +217,5 @@ test_logcorrections = 10. * np.random.randn(len(logweights))
 test_logweights = test_logcorrections+logweights
 test_logweights = test_logweights-np.log(np.sum(np.exp(test_logweights)))
 
-test_loss, test_grad = forward_model(reads_int_list, N_reads, test_logweights, logweights, mutation_matrix)
+test_loss, test_grad = forward_model(reads_int_list, N_reads, test_logweights, logweights, mutation_matrix, mask=position_mask)
 # %%
