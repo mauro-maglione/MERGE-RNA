@@ -25,6 +25,8 @@ from merge_rna import Experiment, MultiSystemsFit
 import RNA
 import bussilab.rna2d as bussi
 from scipy.optimize import minimize
+from scipy.special import logsumexp
+from scipy.sparse import csr_matrix
 
 # %%
 # =============================================================================
@@ -136,56 +138,83 @@ def forward_model_fixed_params(states, a_i, b_i, mask = None):
     if mask is None:
         mask = np.ones(len(a_i), bool)
 
-    mutation_probs = np.zeros(states.shape)
-    for s in range(states.shape[0]):
-        for site in range(states.shape[1]):
-            if mask[site]:
-                if states[s,site] == -1:
-                    mutation_probs[s,site] = a_i[site]
-                else:
-                    mutation_probs[s,site] = a_i[site] + b_i[site]
-        
+    # unpaired (-1) -> a_i, paired -> a_i + b_i; masked columns set to 0
+    mutation_probs = np.where(states == -1, a_i, a_i + b_i) * mask
     return mutation_probs
 
-def forward_model(reads, N_reads, logweights, logweights_0, mutation_probs, mask = None):
-    """Compute loss and derivatives approximately using ensemble of suboptimal structures.
-    Masked positions (mask False) are unobserved: they contribute a factor 1 to every read."""
-
-    # I'm assuming that reads comes in a form that has a the mutated sites -
-    # - in reads and the number of reads with these mutations in N_reads
+def precompute_read_factors(reads, mutation_probs, mask = None):
+    """Weight-independent factors such that logM[r,s] = log P(read r | structure s) = (X @ D.T + base)[r,s].
+    Masked positions (mask False) are unobserved: they contribute a factor 1 to every read
+    (mutations falling on masked sites are ignored).
+    Returns X (sparse, N_reads x N_observed), D (N_samples x N_observed), base (N_samples,)."""
     if mask is None:
         mask = np.ones(mutation_probs.shape[1], bool)
-    observed_sites = set(np.where(mask)[0])
+    observed = np.where(mask)[0]
+    col_of_site = -np.ones(len(mask), int)
+    col_of_site[observed] = np.arange(len(observed))
 
-    normalization = np.sum(np.exp(logweights))
-    log_normalization = np.log(normalization)
+    # sparse binary matrix of mutated observed sites, shape (N_reads, N_observed)
+    rows, cols = [], []
+    for r, read in enumerate(reads):
+        for site in read:
+            if mask[site]:
+                rows.append(r)
+                cols.append(col_of_site[site])
+    X = csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(len(reads), len(observed)))
 
-    # compute the forward model for the mutation probabilities
+    # log M = sum_mut log p + sum_unmut log(1-p) = X @ (log p - log(1-p)) + sum_all log(1-p)
+    P = mutation_probs[:, observed]
+    log1mP = np.log1p(-P)
+    D = np.log(P) - log1mP
+    return X, D, log1mP.sum(axis=1)
+
+def precompute_log_read_likelihood(reads, mutation_probs, mask = None):
+    """Compute logM[r,s] = log P(read r | structure s), which does not depend on the weights.
+    Returns a matrix of shape (N_reads, N_samples): memory N_reads*N_samples*8 bytes,
+    use forward_model_chunked when this is too large."""
+    X, D, base = precompute_read_factors(reads, mutation_probs, mask)
+    return np.asarray(X @ D.T) + base[None, :]
+
+def _loss_and_ratio_sum(N_reads, log_p, logM):
+    """For a block of reads: loss = -sum_r N_r log L_r and ratio_sum_j = sum_r N_r M_rj / L_r,
+    with L_r = sum_s p_s M_rs and log_p the normalized log probabilities of the structures."""
+    # log read likelihoods log L_r = log sum_s P(s) M_rs
+    log_L = logsumexp(logM + log_p[None, :], axis=1)
+    return -np.dot(N_reads, log_L), N_reads @ np.exp(logM - log_L[:, None])
+
+def forward_model(N_reads, logweights, logweights_0, logM):
+    """Compute loss and derivatives approximately using ensemble of suboptimal structures.
+    P(s) = P0(s) W(s) / Z with logweights = log(P0 W); the gradient is taken w.r.t. W.
+    logM comes from precompute_log_read_likelihood."""
+    log_Z = logsumexp(logweights)
+
+    # i'm considering a negative log likelihood
+    loss, ratio_sum = _loss_and_ratio_sum(N_reads, logweights - log_Z, logM)
+
+    # dlogL_r/dW_j = (P0_j/Z) (M_rj/L_r - 1)
+    # (multiply by W = exp(logweights - logweights_0) to get the gradient w.r.t. log W)
+    grad = -np.exp(logweights_0 - log_Z) * (ratio_sum - np.sum(N_reads))
+
+    return loss, grad
+
+def forward_model_chunked(N_reads, logweights, logweights_0, X, D, base, chunk_size = 256):
+    """Same as forward_model, for a number of structures too large to store logM:
+    logM is rebuilt for chunk_size reads at a time, so memory is O(chunk_size*N_samples).
+    X, D, base come from precompute_read_factors."""
+    log_Z = logsumexp(logweights)
+    log_p = logweights - log_Z
+
     loss = 0.
-    grad = np.zeros(len(logweights),float)
+    ratio_sum = np.zeros(len(logweights), float)
+    for start in range(0, X.shape[0], chunk_size):
+        stop = min(start + chunk_size, X.shape[0])
+        logM_chunk = np.asarray(X[start:stop] @ D.T) + base[None, :]
+        chunk_loss, chunk_ratio_sum = _loss_and_ratio_sum(N_reads[start:stop], log_p, logM_chunk)
+        loss += chunk_loss
+        ratio_sum += chunk_ratio_sum
 
-    for r in range(len(reads)):
-        read_likelihood = 0.
-        der_read_likelihood = np.zeros(len(logweights),float)
-        for s in range(mutation_probs.shape[0]):
-            mut_prob_per_struct = 1.
-            for mut_site in reads[r]:
-                if mask[mut_site]:
-                    mut_prob_per_struct *= mutation_probs[s,mut_site]
+    grad = -np.exp(logweights_0 - log_Z) * (ratio_sum - np.sum(N_reads))
 
-            for non_mut_site in observed_sites - set(reads[r]):
-                mut_prob_per_struct *= (1-mutation_probs[s,non_mut_site])
-
-            read_likelihood += np.exp(logweights[s] - log_normalization) * mut_prob_per_struct   
-
-            der_read_likelihood[s] += mut_prob_per_struct * np.exp(logweights_0[s]-log_normalization)
-            der_read_likelihood += - mut_prob_per_struct * np.exp(logweights_0 + logweights[s] - 2*log_normalization) 
-
-        # i'm considering a negative log likelihood
-
-        loss += - N_reads[r]*np.log(read_likelihood)
-        grad += - N_reads[r]*der_read_likelihood / read_likelihood
-            
     return loss, grad
 # %%
 
@@ -213,9 +242,16 @@ reads_str = df['mut_positions'].values
 reads_int_list = [ast.literal_eval(read) for read in reads_str]
 N_reads = df['occurrences'].values
 
-test_logcorrections = 10. * np.random.randn(len(logweights))
+# weight-independent, compute once
+logM = precompute_log_read_likelihood(reads_int_list, mutation_matrix, mask=position_mask)
+
+test_logcorrections = 1. * np.random.randn(len(logweights))
 test_logweights = test_logcorrections+logweights
 test_logweights = test_logweights-np.log(np.sum(np.exp(test_logweights)))
 
-test_loss, test_grad = forward_model(reads_int_list, N_reads, test_logweights, logweights, mutation_matrix, mask=position_mask)
+test_loss, test_grad = forward_model(N_reads, test_logweights, logweights, logM)
+# %%
+obj = lambda x: forward_model(N_reads, x, logweights, logM)
+
+res=minimize(obj,np.zeros(len(logweights)),jac=True,method="L-BFGS-B")
 # %%
