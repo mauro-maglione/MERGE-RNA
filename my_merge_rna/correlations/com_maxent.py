@@ -130,6 +130,26 @@ def structures_sampling(seq, penalty, delta, lambda_sc=None, temperature_C=37):
     states, logweights = bussi.suboptimal_to_numpy(suboptimal = structures, temperature=temperature_C+273.15) 
     return coverage_of_part_func, states, logweights
 
+def structures_sampling_random(seq, penalty, number_samples, lambda_sc=None, temperature_C=37):
+    """Compute the forward model for the mutation probabilities."""
+    # the starting penalty for paired sites, from DMS presence and lambda_sc if available
+    if lambda_sc is not None:
+        lambdas1d = penalty * np.ones(len(seq)) + lambda_sc
+    else:
+        lambdas1d = penalty * np.ones(len(seq))
+
+    # define molecule used for sub_optimal structure sampling
+    # default parameters should be turner 2004
+    mol = bussi.Molecule(seq, lambdas1d=lambdas1d, temperature=temperature_C+273.15) 
+
+    structures = mol.sample(number_samples)
+    energies = np.array([mol.evaluate(struct) for struct in structures])
+    log_coverage = logsumexp(-(energies-mol.total_free_energy())*(1/(bussi._KB*(temperature_C+273.15))))
+
+    # in principle one can sample at a diff temp then the one used for weights
+    states, logweights = bussi.sample_to_numpy(samples = structures, temperature=temperature_C+273.15) 
+    return np.exp(log_coverage), states, logweights
+
 def forward_model_fixed_params(states, a_i, b_i, mask = None):
     """Compute the matrix that needs to be used for all logweights and reads,
     this stores the information about the sampled structures once.
@@ -184,12 +204,12 @@ def _loss_and_ratio_sum(N_reads, log_p, logM):
 
 def forward_model(N_reads, logweights, logweights_0, logM):
     """Compute loss and derivatives approximately using ensemble of suboptimal structures.
-    P(s) = P0(s) W(s) / Z with logweights = log(P0 W); the gradient is taken w.r.t. W.
+    P(s) = P0(s) W(s) / Z with logweights = log(W); the gradient is taken w.r.t. W.
     logM comes from precompute_log_read_likelihood."""
-    log_Z = logsumexp(logweights)
+    log_Z = logsumexp(logweights + logweights_0)
 
     # i'm considering a negative log likelihood
-    loss, ratio_sum = _loss_and_ratio_sum(N_reads, logweights - log_Z, logM)
+    loss, ratio_sum = _loss_and_ratio_sum(N_reads, logweights + logweights_0 - log_Z, logM)
 
     # dlogL_r/dW_j = (P0_j/Z) (M_rj/L_r - 1)
     # (multiply by W = exp(logweights - logweights_0) to get the gradient w.r.t. log W)
@@ -225,15 +245,25 @@ tot_free_en = mol_test.total_free_energy()
 print(f"The minimum free energy is {min_free_en} and the total one {tot_free_en} in kcal/mol")
 
 # %%
+
+DO_RANDOM = False
 # delta 10 -> 145625 struct, 0.998 coverage, delta 5 -> 815 struct, 0.944 coverage
-delta_kcalpermol = 4
+delta_kcalpermol = 5
 coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol)
 
+possible_structures_number = 2.1614 * len(seq)**(-3/2)* 1.96798**len(seq) # asymptotic formula
+coverage_of_structures = states.shape[0]/possible_structures_number
+
 # %%
+
+# id_str = "single_struct"
+#id_str = f"r{REP_NUMBER}_true"
+id_str = f"r{REP_NUMBER}"
+
 path_synthetic_data = os.path.join(os.environ['RNA_STRUCT_HOME'], 'data', 'designed_sequence', 'synthetic_mutation_experiments')
-df = pd.read_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_r{REP_NUMBER}.csv"))
+df = pd.read_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+".csv"))
 # mask saved by generate_synth_mut_experiment.py (True = observed/fitted position, kept indexing of exp.seq)
-position_mask = np.load(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_r{REP_NUMBER}_mask.npy"))
+position_mask = np.load(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+"_mask.npy"))
 assert len(position_mask) == len(seq), f"mask length {len(position_mask)} != sequence length {len(seq)}"
 
 mutation_matrix = forward_model_fixed_params(states, a_i, b_i, mask=position_mask)
@@ -254,4 +284,26 @@ test_loss, test_grad = forward_model(N_reads, test_logweights, logweights, logM)
 obj = lambda x: forward_model(N_reads, x, logweights, logM)
 
 res=minimize(obj,np.zeros(len(logweights)),jac=True,method="L-BFGS-B")
+# %%
+
+# calculate and plot the pairing probabilities
+logweights_fitted = res.x + logweights
+pairing_states = np.where(states == -1, 0, 1)
+
+free_en = logsumexp(logweights_fitted)
+pairing_probs = np.exp(logweights_fitted.T-free_en) @ pairing_states
+pairing_probs_0 = np.exp(logweights.T) @ pairing_states
+
+d_kl = np.exp(logweights_fitted.T) @ (logweights_fitted - free_en - logweights)
+
+# %%
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+ax.plot(pairing_probs, label="fitted")
+ax.plot(pairing_probs_0, label="Vienna")
+ax.set_xlabel('positions')
+ax.set_ylabel('pairing_probability')
+ax.legend()
+fig.tight_layout()
 # %%

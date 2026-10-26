@@ -122,14 +122,15 @@ print(f"Fitted window: kept positions {lo}..{hi} (raw .mm {lo+offset}..{hi+offse
 
 ref_params_path = os.path.join(str(_repo_root), 'fits_paper', 'designed_sequence', 'experimental', 'strand_disp_turner.txt')
 lambda_sc = np.loadtxt(ref_params_path)[8:]
-lambda_sc = np.zeros(len(lambda_sc)) # for now, no soft constraints
+# lambda_sc = np.zeros(len(lambda_sc)) # for now, no soft constraints
 
 sample_number = 50000
 
 # mol = bussi.Molecule(seq, lambdas1d=lambda_sc+penalty*np.ones(len(seq)))
 
 bias = [[0,0],[0,-4]]
-mol_0 = bussi.Molecule(seq, state_positions=[[80,86],[46,52]],state_biases=[bias,bias])
+mol_0 = bussi.Molecule(seq, lambdas1d=penalty*np.ones(len(seq)), state_positions=[[80,86],[46,52]],state_biases=[bias,bias])
+#mol_0 = bussi.Molecule(seq, lambdas1d=penalty*np.ones(len(seq)), state_positions=[[46,52]],state_biases=[bias])
 mat = mol_0.pairing_correlation_matrix()
 bpp = mol_0.base_pairing_probability()
 bpp=np.sum(bpp,axis=0)
@@ -144,15 +145,29 @@ plt.colorbar(label='Pairing correlation')
 # %%
 
 sampled_states, logweights = bussi.sample_to_numpy(mol_0.sample(sample_number), deduplicate=False)
+
+USE_SINGLE_STATE = False
+
+states_enum, _ = bussi.suboptimal_to_numpy(suboptimal = mol_0.suboptimal_structures(2), temperature=37+273.15)
+single_struct = states_enum[0,:]
 # I do it in the stupidest way
 
 sampled_reaction_states = np.zeros(sampled_states.shape, dtype=int)
-for i in range(sample_number):
-    for j in range(len(seq)):
-        if sampled_states[i,j] == -1:
-            sampled_reaction_states[i,j] = np.random.binomial(1, p_reaction_given_unpaired_nb[j])
-        else:
-            sampled_reaction_states[i,j] = np.random.binomial(1, p_reaction_given_paired_nb[j])
+
+if USE_SINGLE_STATE:
+    for i in range(sample_number):
+        for j in range(len(seq)):
+            if single_struct[j] == -1:
+                sampled_reaction_states[i,j] = np.random.binomial(1, p_reaction_given_unpaired_nb[j])
+            else:
+                sampled_reaction_states[i,j] = np.random.binomial(1, p_reaction_given_paired_nb[j])
+else:
+    for i in range(sample_number):
+        for j in range(len(seq)):
+            if sampled_states[i,j] == -1:
+                sampled_reaction_states[i,j] = np.random.binomial(1, p_reaction_given_unpaired_nb[j])
+            else:
+                sampled_reaction_states[i,j] = np.random.binomial(1, p_reaction_given_paired_nb[j])
 
 # %%
 # =============================================================================
@@ -264,9 +279,15 @@ mutation_df = mutation_states_to_dataframe(sampled_mutation_states, sample_name=
 # save dataframe
 path_synthetic_data = os.path.join(os.environ['RNA_STRUCT_HOME'], 'data', 'designed_sequence', 'synthetic_mutation_experiments')
 os.makedirs(path_synthetic_data, exist_ok=True)
-mutation_df.to_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_r{REP_NUMBER}.csv"), index=False)
+
+if USE_SINGLE_STATE:
+    id_str = "single_struct"
+else:
+    id_str = f"r{REP_NUMBER}"
+
+mutation_df.to_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+".csv"), index=False)
 # save the position mask (True = observed/fitted, kept indexing of exp.seq): masked positions carry no information
-np.save(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_r{REP_NUMBER}_mask.npy"), position_mask)
+np.save(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+"_mask.npy"), position_mask)
 
 # %%
 from merge_rna.experiment import load_rc, to_int, bytes_to_seq
