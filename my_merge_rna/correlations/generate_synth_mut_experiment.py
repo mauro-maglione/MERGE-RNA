@@ -143,13 +143,31 @@ plt.imshow(mat-aver_mult, cmap='bwr', vmin=-1, vmax=1)
 plt.colorbar(label='Pairing correlation')
 
 # %%
+USE_SINGLE_STATE = False
+
+np.random.seed(42)
+bussi.set_random_seed(42)
 
 sampled_states, logweights = bussi.sample_to_numpy(mol_0.sample(sample_number), deduplicate=False)
-
-USE_SINGLE_STATE = False
+# the logweights are simply the log(occurrances of structure) since sample does not give weights by default
 
 states_enum, _ = bussi.suboptimal_to_numpy(suboptimal = mol_0.suboptimal_structures(2), temperature=37+273.15)
 single_struct = states_enum[0,:]
+
+pairing_states = np.where(sampled_states == -1, 0, 1)
+pairing_probs_sample = np.exp(logweights.T) @ pairing_states
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+ax.plot(pairing_probs_sample, label="of the sampled struct")
+ax.plot(bpp, label="of the starting ensemble")
+
+ax.set_xlabel('positions')
+ax.set_ylabel('pairing_probability')
+ax.legend()
+fig.tight_layout()
+
+# %%
 # I do it in the stupidest way
 
 sampled_reaction_states = np.zeros(sampled_states.shape, dtype=int)
@@ -225,7 +243,7 @@ fig.tight_layout()
 
 # %%
 
-mutation_counts = sampled_mutation_states.sum(axis=1)
+mutation_counts = sampled_mutation_states.sum(axis=1) #the sum over axis 0 gives the counts per site
 max_k_mutations= max(mutation_counts)
 bins_mutations = range(0, max_k_mutations + 2)
 
@@ -289,8 +307,6 @@ mutation_df.to_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+i
 # save the position mask (True = observed/fitted, kept indexing of exp.seq): masked positions carry no information
 np.save(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+"_mask.npy"), position_mask)
 
-# %%
-from merge_rna.experiment import load_rc, to_int, bytes_to_seq
 
 # %%
 from scripts.mm_file_analysis import load_mm, read_info_field
