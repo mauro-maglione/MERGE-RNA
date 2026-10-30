@@ -257,6 +257,24 @@ ax.set_ylabel('population')
 ax.legend()
 fig.tight_layout()
 
+# plot corrrelations between mutations
+correlation_matrix = sampled_mutation_states.astype(float).T @ sampled_mutation_states.astype(float)
+
+correlation_matrix = correlation_matrix/sampled_mutation_states.shape[0]
+mutation_probs = sampled_mutation_states.sum(axis=0)/sampled_mutation_states.shape[0]
+conn_correl_matrix = correlation_matrix-np.matmul(np.atleast_2d(mutation_probs).T, np.atleast_2d(mutation_probs))
+
+conn_correl_matrix_ = conn_correl_matrix
+np.fill_diagonal(conn_correl_matrix_, 0)
+sd = np.sqrt(mutation_probs * (1 - mutation_probs))
+with np.errstate(divide='ignore', invalid='ignore'):
+    pearson = conn_correl_matrix_ / np.outer(sd, sd)
+pearson[~np.isfinite(pearson)] = 0   # positions never mutated (e.g. masked ends) give 0/0
+
+plt.figure(figsize=(6, 5))
+plt.imshow(pearson, cmap='bwr')
+plt.colorbar(label='Pairing correlation')
+
 # %%
 # =============================================================================
 # Save the synthetic mutation experiment data in .csv format

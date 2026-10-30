@@ -123,7 +123,8 @@ def structures_sampling(seq, penalty, delta, lambda_sc=None, temperature_C=37):
     # default parameters should be turner 2004
     mol = bussi.Molecule(seq, lambdas1d=lambdas1d, temperature=temperature_C+273.15) 
 
-    coverage_of_part_func = mol.suboptimal_coverage(delta)
+    # coverage_of_part_func = mol.suboptimal_coverage(delta)
+    coverage_of_part_func = None
     structures = mol.suboptimal_structures(delta)
 
     # in principle one can sample at a diff temp then the one used for weights
@@ -202,21 +203,27 @@ def _loss_and_ratio_sum(N_reads, log_p, logM):
     log_L = logsumexp(logM + log_p[None, :], axis=1)
     return -np.dot(N_reads, log_L), N_reads @ np.exp(logM - log_L[:, None])
 
-def forward_model(N_reads, logweights, logweights_0, logM, with_dkl = True, alpha = 0.1):
+def forward_model(N_reads, logweights, logweights_0, logM, alpha = 0.1, logweights_ref = None):
     """Compute loss and derivatives approximately using ensemble of suboptimal structures.
     P(s) = P0(s) W(s) / Z with logweights = log(W); the gradient is taken w.r.t. W.
     logM comes from precompute_log_read_likelihood."""
     log_Z = logsumexp(logweights + logweights_0)
+    if logweights_ref is None:
+        logweights_ref = logweights_0
 
     # i'm considering a negative log likelihood
     likelihood, ratio_sum = _loss_and_ratio_sum(N_reads, logweights + logweights_0 - log_Z, logM)
-    kl = (np.exp((logweights + logweights_0 - log_Z)) @ logweights) - log_Z
-    loss = likelihood + alpha*kl
+    if alpha > 0:
+        kl = (np.exp((logweights + logweights_0 - log_Z)) @ (logweights-logweights_ref)) - log_Z
+        loss = likelihood + alpha*kl
+    else:
+        loss = likelihood
 
     # dlogL_r/dW_j = (P0_j/Z) (M_rj/L_r - 1)
     # (multiply by W = exp(logweights - logweights_0) to get the gradient w.r.t. log W)
     grad = -np.exp(logweights_0 - log_Z) * (ratio_sum - np.sum(N_reads))
-    grad += alpha*(2*(np.exp(logweights + logweights_0 - log_Z))-np.exp(logweights_0 - log_Z)*(1+kl+log_Z))
+    if alpha > 0:
+        grad += alpha*(2*(np.exp(logweights + logweights_0 - log_Z))-np.exp(logweights_0 - log_Z)*(1+kl+log_Z))
 
     return loss, grad
 
@@ -260,10 +267,17 @@ print(f"The minimum free energy is {min_free_en} and the total one {tot_free_en}
 # %%
 
 DO_RANDOM = False
-# delta 10 -> 145625 struct, 0.998 coverage, delta 5 -> 815 struct, 0.944 coverage
-delta_kcalpermol = 10
-#coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol, lambda_sc= np.loadtxt(phase1_params)[8:])
-coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol)
+
+if DO_RANDOM:
+    number_of_structures = 5000000
+
+    coverage_of_part_func, states, logweights = structures_sampling_random(seq, penalty, number_of_structures)
+else:
+    # delta 10 -> 145625 struct, 0.998 coverage, delta 5 -> 815 struct, 0.944 coverage
+    delta_kcalpermol = 4
+
+    coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol, lambda_sc= np.loadtxt(phase1_params)[8:])
+    #coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol)
 
 possible_structures_number = 2.1614 * len(seq)**(-3/2)* 1.96798**len(seq) # asymptotic formula
 coverage_of_structures = states.shape[0]/possible_structures_number
@@ -354,6 +368,7 @@ bussi.set_random_seed(42)
 
 delta_good = 5
 good_states_raw = mol_0.suboptimal_structures(delta_good)
+good_coverage_of_part_func = mol_0.suboptimal_coverage(delta_good)
 good_states,_ = bussi.suboptimal_to_numpy(good_states_raw, temperature=37+273.15)
 
 mol_00 = bussi.Molecule(seq, lambdas1d=penalty*np.ones(len(seq)))
