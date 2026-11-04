@@ -309,7 +309,21 @@ def mutation_states_to_dataframe(mutation_states, sample_name="synthetic"):
 
     return pd.DataFrame(data)
 
+def mutation_states_to_counts_dataframe(mutation_states, sample_name="synthetic"):
+    """Convert the mutation states array to a pandas DataFrame with columns indicating
+    the read index, the number of mutations per read and mutation positions."""
+
+    mutation_counts_per_site = np.sum(mutation_states, axis=0) # sum over reads to get counts per site
+    number_of_reads = mutation_states.shape[0] # total number of reads
+
+    data = {'Sample' : sample_name,
+            'mut_count_per_site' : mutation_counts_per_site,
+            'number_of_reads' : number_of_reads}    
+
+    return pd.DataFrame(data)
+
 mutation_df = mutation_states_to_dataframe(sampled_mutation_states, sample_name=f"synthetic_{CONC_MM}mM_r{REP_NUMBER}")
+mutation_counts_df = mutation_states_to_counts_dataframe(sampled_mutation_states, sample_name=f"synthetic_{CONC_MM}mM_r{REP_NUMBER}")
 
 # %%
 # save dataframe
@@ -322,6 +336,7 @@ else:
     id_str = f"r{REP_NUMBER}"
 
 mutation_df.to_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+".csv"), index=False)
+mutation_counts_df.to_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+"_counts.csv"), index=False)
 # save the position mask (True = observed/fitted, kept indexing of exp.seq): masked positions carry no information
 np.save(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+"_mask.npy"), position_mask)
 
