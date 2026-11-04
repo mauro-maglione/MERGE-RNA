@@ -9,7 +9,12 @@ import argparse
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-_repo_root = pathlib.Path(__file__).resolve().parents[2]
+try:
+    _repo_root = pathlib.Path(__file__).resolve().parents[2]
+except NameError:
+    _cwd = pathlib.Path.cwd().resolve()
+    _repo_root = next(p for p in [_cwd, *_cwd.parents] if (p / 'merge_rna').is_dir())
+    
 os.environ.setdefault('RNA_STRUCT_HOME', str(_repo_root))
 sys.path.insert(0, os.environ['RNA_STRUCT_HOME'])
 os.chdir(str(_repo_root))
@@ -163,50 +168,26 @@ def forward_model_fixed_params(states, a_i, b_i, mask = None):
     mutation_probs = np.where(states == -1, a_i, a_i + b_i) * mask
     return mutation_probs
 
-def precompute_read_factors(reads, mutation_probs, mask = None):
-    """Weight-independent factors such that logM[r,s] = log P(read r | structure s) = (X @ D.T + base)[r,s].
-    Masked positions (mask False) are unobserved: they contribute a factor 1 to every read
-    (mutations falling on masked sites are ignored).
-    Returns X (sparse, N_reads x N_observed), D (N_samples x N_observed), base (N_samples,)."""
-    if mask is None:
-        mask = np.ones(mutation_probs.shape[1], bool)
-    observed = np.where(mask)[0]
-    col_of_site = -np.ones(len(mask), int)
-    col_of_site[observed] = np.arange(len(observed))
-
-    # sparse binary matrix of mutated observed sites, shape (N_reads, N_observed)
-    rows, cols = [], []
-    for r, read in enumerate(reads):
-        for site in read:
-            if mask[site]:
-                rows.append(r)
-                cols.append(col_of_site[site])
-    X = csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(len(reads), len(observed)))
-
-    # log M = sum_mut log p + sum_unmut log(1-p) = X @ (log p - log(1-p)) + sum_all log(1-p)
-    P = mutation_probs[:, observed]
-    log1mP = np.log1p(-P)
-    D = np.log(P) - log1mP
-    return X, D, log1mP.sum(axis=1)
-
 def _loss_and_der_coeff_loss(mut_i, read_i, mut_mat, log_p):
+    # inputs: observed mutations per site, reads per site, mutation matrix (N_samples x N_seq), new log weights (N_samples,)
     """loss = -sum_i (m_i log M_i +(T_i-m_i) log(1-M_i)) and coeff_q = deriv_bin*(M_qi - M_i),
     with M_i expected mutation rate at site i."""
     aver_mut_rates = np.exp(log_p) @ mut_mat
-    log_L = np.sum(np.log(aver_mut_rates) * mut_i + np.log1p(-aver_mut_rates) * (read_i - mut_i))
-    coeff_q = np.sum((mut_mat - aver_mut_rates) * (mut_i / aver_mut_rates - (read_i - mut_i) / (1 - aver_mut_rates)), axis=0)
+    log_L = -1*np.sum(np.log(aver_mut_rates) * mut_i + np.log1p(-aver_mut_rates) * (read_i - mut_i))
+    coeff_q = -1 * (mut_mat - aver_mut_rates) @ (mut_i / aver_mut_rates - (read_i - mut_i) / (1 - aver_mut_rates))
     return log_L, coeff_q
 
-def forward_model(N_reads, logweights, logweights_0, logweights_ref, logM, alpha = 0.1):
+def forward_model(mut_i, read_i, logweights, logweights_0, logweights_ref, M, mask=None, alpha = 0.1):
     """Compute loss and derivatives approximately using ensemble of suboptimal structures.
     P(s) = P0(s) W(s) / Z with logweights = log(W); the gradient is taken w.r.t. W.
     logM comes from precompute_log_read_likelihood."""
+
     log_Z = logsumexp(logweights + logweights_0)
 
     # i'm considering a negative log likelihood
-    likelihood, grad_coeff = _loss_and_der_coeff_loss(N_reads, logweights + logweights_0 - log_Z, logM)
+    likelihood, grad_coeff = _loss_and_der_coeff_loss(mut_i, read_i, M, logweights + logweights_0 - log_Z)
     if alpha > 0:
-        kl = (np.exp((logweights + logweights_0 - log_Z)) @ (logweights-logweights_ref)) - log_Z
+        kl = (np.exp((logweights + logweights_0 - log_Z)) @ (logweights + logweights_0-logweights_ref)) - log_Z
         loss = likelihood + alpha*kl
     else:
         loss = likelihood
@@ -215,30 +196,79 @@ def forward_model(N_reads, logweights, logweights_0, logweights_ref, logM, alpha
     # (multiply by W = exp(logweights - logweights_0) to get the gradient w.r.t. log W)
     grad = np.exp(logweights_0 - log_Z) * grad_coeff
     if alpha > 0:
-        grad += alpha*(2*(np.exp(logweights + logweights_0 - log_Z))-np.exp(logweights_0 - log_Z)*(1+kl+log_Z))
+        grad += alpha * np.exp(logweights_0 - log_Z) * (logweights + logweights_0 - log_Z - logweights_ref - kl) # logZ and kl should get promoted to be vectors
 
     return loss, grad
 
 # %%
 
-def do_optimization(logweights, states, seq, penalty,
-                         data_frame_exp, position_mask
+def do_optimization(logweights, states, seq, penalty, a_i, b_i,
+                         data_frame_exp, position_mask,
+                         alpha
                          ):
 
-    if states.shape[0]>200000:
-        raise ValueError(f"Too many structures n = {states.shape[0]}, optimization is slow")
+    #if states.shape[0]>200000:
+    #    raise ValueError(f"Too many structures n = {states.shape[0]}, optimization is slow")
     
     molecule_ref = bussi.Molecule(seq, lambdas1d=penalty*np.ones(len(seq)))
     logweights_ref = np.apply_along_axis(molecule_ref.evaluate, 1, states)
 
     mutation_matrix = forward_model_fixed_params(states, a_i, b_i, mask=position_mask)
 
-    reads_str = data_frame_exp['mut_positions'].values
-    reads_int_list = [ast.literal_eval(read) for read in reads_str]
-    N_reads = data_frame_exp['occurrences'].values
+    mut_counts = data_frame_exp['mut_count_per_site'].values
+    read_counts = data_frame_exp['number_of_reads'].values
+    mutation_prob_mat = forward_model_fixed_params(states, a_i, b_i, mask=position_mask)
 
-    logM = precompute_log_read_likelihood(reads_int_list, mutation_matrix, mask=position_mask)
-    obj = lambda x: forward_model(N_reads, x, logweights, logweights_ref, logM)
+    mut_counts_masked = mut_counts[position_mask]
+    read_counts_masked = read_counts[position_mask]
+    mutation_prob_mat_masked = mutation_prob_mat[:, position_mask]
+
+    obj = lambda x: forward_model(mut_counts_masked, read_counts_masked, x, logweights, logweights_ref, mutation_prob_mat_masked, alpha=alpha)
 
     res=minimize(obj,np.zeros(len(logweights)),jac=True,method="L-BFGS-B")
     return res
+
+# id_str = "single_struct"
+# id_str = f"r{REP_NUMBER}_true" # this is the forceded population of 80%
+id_str = f"r{REP_NUMBER}_larger" # this is the forceded strand_displacement
+
+path_synthetic_data = os.path.join(os.environ['RNA_STRUCT_HOME'], 'data', 'designed_sequence', 'synthetic_mutation_experiments')
+df = pd.read_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+"_counts.csv"))
+# mask saved by generate_synth_mut_experiment.py (True = observed/fitted position, kept indexing of exp.seq)
+position_mask = np.load(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+"_mask.npy"))
+assert len(position_mask) == len(seq), f"mask length {len(position_mask)} != sequence length {len(seq)}"
+
+delta_kcalpermol = 6
+
+coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol, lambda_sc= np.loadtxt(phase1_params)[8:])
+# coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol)
+
+result = do_optimization(logweights, states, seq, penalty, a_i, b_i,
+                         df, position_mask, alpha = 0.00001)
+# %%
+
+# calculate and plot the pairing probabilities
+logweights_fitted = result.x + logweights
+pairing_states = np.where(states == -1, 0, 1)
+
+free_en = logsumexp(logweights_fitted)
+pairing_probs = np.exp(logweights_fitted.T-free_en) @ pairing_states
+pairing_probs_0 = np.exp(logweights.T) @ pairing_states
+
+correlation_matrix = np.zeros([states.shape[1],states.shape[1]])
+
+for struct_ind in np.arange(states.shape[0]):
+    state = pairing_states[struct_ind,:][np.newaxis]
+    correlation_matrix += (state.T @ state)*np.exp(logweights_fitted[struct_ind]-free_en)
+
+unconn_correl_matrix = correlation_matrix-np.matmul(np.atleast_2d(pairing_probs).T, np.atleast_2d(pairing_probs))
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+ax.plot(pairing_probs, label="fitted")
+ax.plot(pairing_probs_0, label="Vienna")
+ax.set_xlabel('positions')
+ax.set_ylabel('pairing_probability')
+ax.legend()
+fig.tight_layout()
+# %%

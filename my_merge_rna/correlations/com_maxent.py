@@ -214,7 +214,7 @@ def forward_model(N_reads, logweights, logweights_0, logM, alpha = 0.1, logweigh
     # i'm considering a negative log likelihood
     likelihood, ratio_sum = _loss_and_ratio_sum(N_reads, logweights + logweights_0 - log_Z, logM)
     if alpha > 0:
-        kl = (np.exp((logweights + logweights_0 - log_Z)) @ (logweights-logweights_ref)) - log_Z
+        kl = (np.exp((logweights + logweights_0 - log_Z)) @ (logweights + logweights_0-logweights_ref)) - log_Z
         loss = likelihood + alpha*kl
     else:
         loss = likelihood
@@ -223,16 +223,19 @@ def forward_model(N_reads, logweights, logweights_0, logM, alpha = 0.1, logweigh
     # (multiply by W = exp(logweights - logweights_0) to get the gradient w.r.t. log W)
     grad = -np.exp(logweights_0 - log_Z) * (ratio_sum - np.sum(N_reads))
     if alpha > 0:
-        grad += alpha*(2*(np.exp(logweights + logweights_0 - log_Z))-np.exp(logweights_0 - log_Z)*(1+kl+log_Z))
+        grad += alpha * np.exp(logweights_0 - log_Z) * (logweights + logweights_0 - log_Z - logweights_ref - kl)
 
     return loss, grad
 
-def forward_model_chunked(N_reads, logweights, logweights_0, X, D, base, alpha=0.1, chunk_size = 256):
+def forward_model_chunked(N_reads, logweights, logweights_0, X, D, base, alpha=0.1, logweights_ref=None, chunk_size = 256):
     """Same as forward_model, for a number of structures too large to store logM:
     logM is rebuilt for chunk_size reads at a time, so memory is O(chunk_size*N_samples).
     X, D, base come from precompute_read_factors."""
     log_Z = logsumexp(logweights)
     log_p = logweights - log_Z
+
+    if logweights_ref is None:
+        logweights_ref = logweights_0
 
     likelihood = 0.
     ratio_sum = np.zeros(len(logweights), float)
@@ -244,7 +247,7 @@ def forward_model_chunked(N_reads, logweights, logweights_0, X, D, base, alpha=0
         ratio_sum += chunk_ratio_sum
 
     if alpha > 0:
-        kl = (np.exp((logweights + logweights_0 - log_Z)) @ logweights) - log_Z
+        kl = (np.exp((logweights + logweights_0 - log_Z)) @ (logweights + logweights_0-logweights_ref)) - log_Z
         loss = likelihood + alpha*kl
     else:
         loss = likelihood 
@@ -252,8 +255,7 @@ def forward_model_chunked(N_reads, logweights, logweights_0, X, D, base, alpha=0
     grad = -np.exp(logweights_0 - log_Z) * (ratio_sum - np.sum(N_reads))
 
     if alpha > 0:
-        grad += alpha*(2*(np.exp(logweights + logweights_0 - log_Z))-np.exp(logweights_0 - log_Z)*(1+kl+log_Z))
-
+        grad += alpha * np.exp(logweights_0 - log_Z) * (logweights + logweights_0 - log_Z - logweights_ref - kl) # logZ and kl should get promoted to be vectors
 
     return loss, grad
 # %%

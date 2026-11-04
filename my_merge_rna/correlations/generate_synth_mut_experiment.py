@@ -124,7 +124,7 @@ ref_params_path = os.path.join(str(_repo_root), 'fits_paper', 'designed_sequence
 lambda_sc = np.loadtxt(ref_params_path)[8:]
 # lambda_sc = np.zeros(len(lambda_sc)) # for now, no soft constraints
 
-sample_number = 50000
+sample_number = 1000000
 
 # mol = bussi.Molecule(seq, lambdas1d=lambda_sc+penalty*np.ones(len(seq)))
 
@@ -322,24 +322,28 @@ def mutation_states_to_counts_dataframe(mutation_states, sample_name="synthetic"
 
     return pd.DataFrame(data)
 
-mutation_df = mutation_states_to_dataframe(sampled_mutation_states, sample_name=f"synthetic_{CONC_MM}mM_r{REP_NUMBER}")
-mutation_counts_df = mutation_states_to_counts_dataframe(sampled_mutation_states, sample_name=f"synthetic_{CONC_MM}mM_r{REP_NUMBER}")
+if USE_SINGLE_STATE:
+    id_str = "single_struct"
+else:
+    # id_str = f"r{REP_NUMBER}_true" # this is the forceded population of 80%
+    id_str = f"r{REP_NUMBER}_larger" # this is the forceded strand_displacement
+
+mutation_df = mutation_states_to_dataframe(sampled_mutation_states, sample_name=f"synthetic_{CONC_MM}mM_"+id_str)
+mutation_counts_df = mutation_states_to_counts_dataframe(sampled_mutation_states, sample_name=f"synthetic_{CONC_MM}mM_"+id_str)
 
 # %%
 # save dataframe
 path_synthetic_data = os.path.join(os.environ['RNA_STRUCT_HOME'], 'data', 'designed_sequence', 'synthetic_mutation_experiments')
 os.makedirs(path_synthetic_data, exist_ok=True)
 
-if USE_SINGLE_STATE:
-    id_str = "single_struct"
-else:
-    id_str = f"r{REP_NUMBER}"
-
 mutation_df.to_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+".csv"), index=False)
 mutation_counts_df.to_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+"_counts.csv"), index=False)
 # save the position mask (True = observed/fitted, kept indexing of exp.seq): masked positions carry no information
 np.save(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+"_mask.npy"), position_mask)
 
+# %%
+# possibly make a plot of the mutation counts and the max likelihood estimates of the pairing probabilities
+plt.plot(np.sum(sampled_mutation_states, axis=0))
 
 # %%
 from scripts.mm_file_analysis import load_mm, read_info_field
