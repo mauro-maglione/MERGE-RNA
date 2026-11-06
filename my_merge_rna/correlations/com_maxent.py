@@ -9,7 +9,12 @@ import argparse
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-_repo_root = pathlib.Path(__file__).resolve().parents[2]
+try:
+    _repo_root = pathlib.Path(__file__).resolve().parents[2]
+except NameError:
+    _cwd = pathlib.Path.cwd().resolve()
+    _repo_root = next(p for p in [_cwd, *_cwd.parents] if (p / 'merge_rna').is_dir())
+    
 os.environ.setdefault('RNA_STRUCT_HOME', str(_repo_root))
 sys.path.insert(0, os.environ['RNA_STRUCT_HOME'])
 os.chdir(str(_repo_root))
@@ -123,8 +128,7 @@ def structures_sampling(seq, penalty, delta, lambda_sc=None, temperature_C=37):
     # default parameters should be turner 2004
     mol = bussi.Molecule(seq, lambdas1d=lambdas1d, temperature=temperature_C+273.15) 
 
-    # coverage_of_part_func = mol.suboptimal_coverage(delta)
-    coverage_of_part_func = None
+    coverage_of_part_func = mol.suboptimal_coverage(delta)
     structures = mol.suboptimal_structures(delta)
 
     # in principle one can sample at a diff temp then the one used for weights
@@ -203,10 +207,13 @@ def _loss_and_ratio_sum(N_reads, log_p, logM):
     log_L = logsumexp(logM + log_p[None, :], axis=1)
     return -np.dot(N_reads, log_L), N_reads @ np.exp(logM - log_L[:, None])
 
-def forward_model(N_reads, logweights, logweights_0, logM, alpha = 0.1, logweights_ref = None):
+def forward_model(N_reads, weights, logweights_0, logM, alpha = 0.1, logweights_ref = None):
     """Compute loss and derivatives approximately using ensemble of suboptimal structures.
     P(s) = P0(s) W(s) / Z with logweights = log(W); the gradient is taken w.r.t. W.
     logM comes from precompute_log_read_likelihood."""
+
+    logweights = np.log(weights)
+
     log_Z = logsumexp(logweights + logweights_0)
     if logweights_ref is None:
         logweights_ref = logweights_0
@@ -227,12 +234,14 @@ def forward_model(N_reads, logweights, logweights_0, logM, alpha = 0.1, logweigh
 
     return loss, grad
 
-def forward_model_chunked(N_reads, logweights, logweights_0, X, D, base, alpha=0.1, logweights_ref=None, chunk_size = 256):
+def forward_model_chunked(N_reads, weights, logweights_0, X, D, base, alpha=0.1, logweights_ref=None, chunk_size = 256):
     """Same as forward_model, for a number of structures too large to store logM:
     logM is rebuilt for chunk_size reads at a time, so memory is O(chunk_size*N_samples).
     X, D, base come from precompute_read_factors."""
-    log_Z = logsumexp(logweights)
-    log_p = logweights - log_Z
+    
+    logweights = np.log(weights)
+    log_Z = logsumexp(logweights+logweights_0)
+    log_p = logweights + logweights_0 - log_Z
 
     if logweights_ref is None:
         logweights_ref = logweights_0
@@ -273,13 +282,13 @@ DO_RANDOM = False
 if DO_RANDOM:
     number_of_structures = 5000000
 
-    coverage_of_part_func, states, logweights = structures_sampling_random(seq, penalty, number_of_structures)
+    coverage_of_part_func, states, logweights_0 = structures_sampling_random(seq, penalty, number_of_structures)
 else:
     # delta 10 -> 145625 struct, 0.998 coverage, delta 5 -> 815 struct, 0.944 coverage
-    delta_kcalpermol = 4
+    delta_kcalpermol = 5
 
-    coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol, lambda_sc= np.loadtxt(phase1_params)[8:])
-    #coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol)
+    # coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol, lambda_sc= np.loadtxt(phase1_params)[8:])
+    coverage_of_part_func, states, logweights_0 = structures_sampling(seq, penalty, delta_kcalpermol)
 
 possible_structures_number = 2.1614 * len(seq)**(-3/2)* 1.96798**len(seq) # asymptotic formula
 coverage_of_structures = states.shape[0]/possible_structures_number
@@ -306,35 +315,42 @@ N_reads = df['occurrences'].values
 logM = precompute_log_read_likelihood(reads_int_list, mutation_matrix, mask=position_mask)
 X, D, base = precompute_read_factors(reads_int_list, mutation_matrix, position_mask)
 
-test_logcorrections = 1. * np.random.randn(len(logweights))
-test_logweights = test_logcorrections+logweights
+test_logcorrections = 1. * np.random.randn(len(logweights_0))
+test_logweights = test_logcorrections+logweights_0
 test_logweights = test_logweights-np.log(np.sum(np.exp(test_logweights)))
 
 # %%
-test_loss, test_grad = forward_model(N_reads, test_logweights, logweights, logM)
+# test_loss, test_grad = forward_model(N_reads, np.exp(test_logweights), logweights_0, logM)
 
 # %%
-test_loss, test_grad = forward_model_chunked(N_reads, test_logweights, logweights, X, D, base)
+test_loss, test_grad = forward_model_chunked(N_reads, np.exp(test_logcorrections), logweights_0, X, D, base)
 
 # %%
 
-if len(logweights)<200000:
+bounds = [(np.finfo(np.float64).eps, None)] * len(logweights_0)
+
+molecule_ref = bussi.Molecule(seq, lambdas1d=penalty*np.ones(len(seq)))
+enrgies_ref = np.apply_along_axis(molecule_ref.evaluate, 1, states)
+logweights_ref = -enrgies_ref / (bussi._KB * (37 + 273.15))
+logweights_ref -= logsumexp(logweights_ref)
+
+if len(logweights_0)<200000:
     logM = precompute_log_read_likelihood(reads_int_list, mutation_matrix, mask=position_mask)
-    obj = lambda x: forward_model(N_reads, x, logweights, logM)
+    obj = lambda x: forward_model(N_reads, x, logweights_0, logM,logweights_ref=logweights_ref, alpha=0.00001)
 else:
     X, D, base = precompute_read_factors(reads_int_list, mutation_matrix, position_mask)
-    obj = lambda x: forward_model_chunked(N_reads, x, logweights, X, D, base)
+    obj = lambda x: forward_model_chunked(N_reads, x, logweights_0, X, D, base, logweights_ref=logweights_ref, alpha=0.00001)
 
-res=minimize(obj,np.zeros(len(logweights)),jac=True,method="L-BFGS-B")
+res=minimize(obj,np.ones(len(logweights_0)),jac=True,method="L-BFGS-B", bounds=bounds)
 # %%
 
 # calculate and plot the pairing probabilities
-logweights_fitted = res.x + logweights
+logweights_fitted = np.log(res.x) + logweights_0
 pairing_states = np.where(states == -1, 0, 1)
 
 free_en = logsumexp(logweights_fitted)
 pairing_probs = np.exp(logweights_fitted.T-free_en) @ pairing_states
-pairing_probs_0 = np.exp(logweights.T) @ pairing_states
+pairing_probs_0 = np.exp(logweights_0.T) @ pairing_states
 
 correlation_matrix = np.zeros([states.shape[1],states.shape[1]])
 
@@ -344,7 +360,7 @@ for struct_ind in np.arange(states.shape[0]):
 
 unconn_correl_matrix = correlation_matrix-np.matmul(np.atleast_2d(pairing_probs).T, np.atleast_2d(pairing_probs))
 
-d_kl = np.exp(logweights_fitted.T+logweights.T-free_en) @ (logweights_fitted - free_en)
+d_kl = np.exp(logweights_fitted.T+logweights_0.T-free_en) @ (logweights_fitted - free_en)
 
 # %%
 
@@ -368,31 +384,47 @@ mol_0 = bussi.Molecule(seq, lambdas1d=penalty*np.ones(len(seq)), state_positions
 np.random.seed(42)
 bussi.set_random_seed(42)
 
-delta_good = 5
+delta_good = 6
 good_states_raw = mol_0.suboptimal_structures(delta_good)
 good_coverage_of_part_func = mol_0.suboptimal_coverage(delta_good)
-good_states,_ = bussi.suboptimal_to_numpy(good_states_raw, temperature=37+273.15)
+good_states,logweights_target = bussi.suboptimal_to_numpy(good_states_raw, temperature=37+273.15)
 
 mol_00 = bussi.Molecule(seq, lambdas1d=penalty*np.ones(len(seq)))
-vienna_logweights_of_good = mol_00.evaluate(good_states_raw) # could have also passed good_states
+E = mol_00.evaluate(good_states)          # or good_states_raw
+lw = -E / (bussi._KB * (37 + 273.15))
+vienna_logweights_of_good = lw - logsumexp(lw)
+print(f"Number of produced structures: {good_states.shape[0]}, coverage of partition function: {good_coverage_of_part_func}, delta: {delta_good} kcal/mol")
 
 # %%
 mutation_matrix_good = forward_model_fixed_params(good_states, a_i, b_i, mask=position_mask)
 logM_good = precompute_log_read_likelihood(reads_int_list, mutation_matrix_good, mask=position_mask)
 
-obj = lambda x: forward_model(N_reads, x, vienna_logweights_of_good, logM_good)
-res=minimize(obj,np.zeros(len(vienna_logweights_of_good)),jac=True,method="L-BFGS-B")
+bounds = [(np.finfo(np.float64).eps, None)] * len(vienna_logweights_of_good)
+alpha = 0
+do_stupid_test = True
+
+if do_stupid_test:
+    obj = lambda x: forward_model(N_reads, x, logweights_target, logM_good, alpha=alpha)
+else:
+    obj = lambda x: forward_model(N_reads, x, vienna_logweights_of_good, logM_good, alpha=alpha)
+
+res=minimize(obj,np.ones(len(vienna_logweights_of_good)),jac=True,method="L-BFGS-B", bounds=bounds)
+
 # %%
 
-logweights_fitted_good = res.x + vienna_logweights_of_good
+logweights_fitted_good = np.log(res.x) + vienna_logweights_of_good
 pairing_states_good = np.where(good_states == -1, 0, 1)
 
 free_en_good = logsumexp(logweights_fitted_good)
 pairing_probs_good = np.exp(logweights_fitted_good.T-free_en_good) @ pairing_states_good
+pairing_probs_good_0 = np.exp(vienna_logweights_of_good.T) @ pairing_states_good
+pairing_probs_good_target = np.exp(logweights_target.T) @ pairing_states_good
 
 fig, ax = plt.subplots(figsize=(8, 5))
 
 ax.plot(pairing_probs_good, label="fitted")
+ax.plot(pairing_probs_good_0, label="Vienna")
+ax.plot(pairing_probs_good_target, label="Target")
 
 ax.set_xlabel('positions')
 ax.set_ylabel('pairing_probability')

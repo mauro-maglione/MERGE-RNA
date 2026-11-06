@@ -177,11 +177,12 @@ def _loss_and_der_coeff_loss(mut_i, read_i, mut_mat, log_p):
     coeff_q = -1 * (mut_mat - aver_mut_rates) @ (mut_i / aver_mut_rates - (read_i - mut_i) / (1 - aver_mut_rates))
     return log_L, coeff_q
 
-def forward_model(mut_i, read_i, logweights, logweights_0, logweights_ref, M, mask=None, alpha = 0.1):
+def forward_model(mut_i, read_i, weights, logweights_0, logweights_ref, M, mask=None, alpha = 0.1):
     """Compute loss and derivatives approximately using ensemble of suboptimal structures.
     P(s) = P0(s) W(s) / Z with logweights = log(W); the gradient is taken w.r.t. W.
     logM comes from precompute_log_read_likelihood."""
 
+    logweights = np.log(weights)
     log_Z = logsumexp(logweights + logweights_0)
 
     # i'm considering a negative log likelihood
@@ -211,7 +212,9 @@ def do_optimization(logweights, states, seq, penalty, a_i, b_i,
     #    raise ValueError(f"Too many structures n = {states.shape[0]}, optimization is slow")
     
     molecule_ref = bussi.Molecule(seq, lambdas1d=penalty*np.ones(len(seq)))
-    logweights_ref = np.apply_along_axis(molecule_ref.evaluate, 1, states)
+    enrgies_ref = np.apply_along_axis(molecule_ref.evaluate, 1, states)
+    logweights_ref = -enrgies_ref / (bussi._KB * (37 + 273.15))
+    logweights_ref -= logsumexp(logweights_ref)
 
     mutation_matrix = forward_model_fixed_params(states, a_i, b_i, mask=position_mask)
 
@@ -225,7 +228,8 @@ def do_optimization(logweights, states, seq, penalty, a_i, b_i,
 
     obj = lambda x: forward_model(mut_counts_masked, read_counts_masked, x, logweights, logweights_ref, mutation_prob_mat_masked, alpha=alpha)
 
-    res=minimize(obj,np.zeros(len(logweights)),jac=True,method="L-BFGS-B")
+    bounds = [(np.finfo(np.float64).eps, None)] * len(logweights)
+    res=minimize(obj,np.ones(len(logweights)),jac=True,method="L-BFGS-B", bounds=bounds)
     return res
 
 # id_str = "single_struct"
@@ -238,17 +242,17 @@ df = pd.read_csv(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_
 position_mask = np.load(os.path.join(path_synthetic_data, f"synthetic_{CONC_MM}mM_"+id_str+"_mask.npy"))
 assert len(position_mask) == len(seq), f"mask length {len(position_mask)} != sequence length {len(seq)}"
 
-delta_kcalpermol = 6
+delta_kcalpermol = 10
 
-coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol, lambda_sc= np.loadtxt(phase1_params)[8:])
-# coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol)
+#coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol, lambda_sc= np.loadtxt(phase1_params)[8:])
+coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol)
 
 result = do_optimization(logweights, states, seq, penalty, a_i, b_i,
                          df, position_mask, alpha = 0.00001)
 # %%
 
 # calculate and plot the pairing probabilities
-logweights_fitted = result.x + logweights
+logweights_fitted = np.log(result.x) + logweights
 pairing_states = np.where(states == -1, 0, 1)
 
 free_en = logsumexp(logweights_fitted)
