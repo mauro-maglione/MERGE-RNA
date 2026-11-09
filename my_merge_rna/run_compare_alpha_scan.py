@@ -33,15 +33,22 @@ import argparse
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-os.environ.setdefault("RNA_STRUCT_HOME", repo_root)
-sys.path.insert(0, repo_root)
-os.chdir(repo_root)
+import pathlib
+
+try:
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+except NameError:
+    _cwd = pathlib.Path.cwd().resolve()
+    repo_root = next(p for p in [_cwd, *_cwd.parents] if (p / 'merge_rna').is_dir())
+
+os.environ.setdefault('RNA_STRUCT_HOME', str(repo_root))
+sys.path.insert(0, os.environ['RNA_STRUCT_HOME'])
 
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")  # headless: this script never has a display attached
+if __name__ == '__main__':
+    matplotlib.use("Agg")  # headless: the nohup scan never has a display attached (not forced on importers)
 import matplotlib.pyplot as plt
 import RNA
 from scipy.optimize import minimize
@@ -133,7 +140,8 @@ def bounds_array_with_mask(n_seq, mask, bound_abs):
     return boundaries
 
 
-def maxent(seq,bpp_ref,*, sigma_squared, penalty=None, boundaries=None, natural_boundaries=False, initial_guess=None, rescale=True,version=0,T=None,deriv_correct=False,alpha=0.0,tol=None):
+def maxent(seq,bpp_ref,*, sigma_squared, penalty=None, boundaries=None, natural_boundaries=False, 
+           initial_guess=None, rescale=True,version=0,T=None,deriv_correct=False,alpha=0.0,tol=None):
     # seq: sequence
     # bpp_ref: array with base pairing probabilities to be enforced
     # sigma_squared error estimate, enters in derivative and regularization

@@ -148,7 +148,8 @@ def structures_sampling_random(seq, penalty, number_samples, lambda_sc=None, tem
     mol = bussi.Molecule(seq, lambdas1d=lambdas1d, temperature=temperature_C+273.15) 
 
     structures = mol.sample(number_samples)
-    energies = np.array([mol.evaluate(struct) for struct in structures])
+    uniq = list(set(structures))
+    energies = mol.evaluate(uniq)
     log_coverage = logsumexp(-(energies-mol.total_free_energy())*(1/(bussi._KB*(temperature_C+273.15))))
 
     # in principle one can sample at a diff temp then the one used for weights
@@ -287,11 +288,12 @@ else:
     # delta 10 -> 145625 struct, 0.998 coverage, delta 5 -> 815 struct, 0.944 coverage
     delta_kcalpermol = 5
 
-    # coverage_of_part_func, states, logweights = structures_sampling(seq, penalty, delta_kcalpermol, lambda_sc= np.loadtxt(phase1_params)[8:])
-    coverage_of_part_func, states, logweights_0 = structures_sampling(seq, penalty, delta_kcalpermol)
+    coverage_of_part_func, states, logweights_0 = structures_sampling(seq, penalty, delta_kcalpermol, lambda_sc= np.loadtxt(phase1_params)[8:])
+    #coverage_of_part_func, states, logweights_0 = structures_sampling(seq, penalty, delta_kcalpermol)
 
 possible_structures_number = 2.1614 * len(seq)**(-3/2)* 1.96798**len(seq) # asymptotic formula
 coverage_of_structures = states.shape[0]/possible_structures_number
+print(f"Number of produced structures: {states.shape[0]}, coverage of partition function: {coverage_of_part_func}, delta: {delta_kcalpermol} kcal/mol")
 
 # %%
 
@@ -401,7 +403,7 @@ logM_good = precompute_log_read_likelihood(reads_int_list, mutation_matrix_good,
 
 bounds = [(np.finfo(np.float64).eps, None)] * len(vienna_logweights_of_good)
 alpha = 0
-do_stupid_test = True
+do_stupid_test = False
 
 if do_stupid_test:
     obj = lambda x: forward_model(N_reads, x, logweights_target, logM_good, alpha=alpha)
@@ -412,7 +414,11 @@ res=minimize(obj,np.ones(len(vienna_logweights_of_good)),jac=True,method="L-BFGS
 
 # %%
 
-logweights_fitted_good = np.log(res.x) + vienna_logweights_of_good
+if do_stupid_test:
+    logweights_fitted_good = np.log(res.x) + logweights_target
+else:
+    logweights_fitted_good = np.log(res.x) + vienna_logweights_of_good
+
 pairing_states_good = np.where(good_states == -1, 0, 1)
 
 free_en_good = logsumexp(logweights_fitted_good)

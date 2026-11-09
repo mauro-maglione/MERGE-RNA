@@ -128,8 +128,8 @@ def structures_sampling(seq, penalty, delta, lambda_sc=None, temperature_C=37):
     # default parameters should be turner 2004
     mol = bussi.Molecule(seq, lambdas1d=lambdas1d, temperature=temperature_C+273.15) 
 
-    # coverage_of_part_func = mol.suboptimal_coverage(delta)
-    coverage_of_part_func = None
+    coverage_of_part_func = mol.suboptimal_coverage(delta)
+    # coverage_of_part_func = None
     structures = mol.suboptimal_structures(delta)
 
     # in principle one can sample at a diff temp then the one used for weights
