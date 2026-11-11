@@ -10,6 +10,7 @@ Quick contained test on the bistable 29-nt sequence CACACAC UUUU GUGUGUG UUUU CA
      if the maxent solution is a fixed point, the optimal weights should stay W=1.
 """
 import ast
+from collections.abc import Iterable
 import os
 import pathlib
 import sys
@@ -33,6 +34,7 @@ import RNA
 import bussilab.rna2d as bussi
 from scipy.optimize import minimize
 from scipy.special import logsumexp
+from scipy.sparse import csr_matrix
 
 from merge_rna import Experiment, MultiSystemsFit
 from run_compare_alpha_scan import maxent, compute_expansion_parameters,bounds_array_with_mask
@@ -44,22 +46,62 @@ _subopt_defs = [n for n in ast.parse(_subopt_src).body if isinstance(n, ast.Func
                                '_loss_and_der_coeff_loss', 'forward_model', 'do_optimization')]
 exec(compile(ast.Module(body=_subopt_defs, type_ignores=[]), 'subopt_merge.py', 'exec'))
 
+# same for com_maxent.py (read-level likelihood), but in a separate namespace: some names
+# (forward_model, forward_model_fixed_params) clash with the subopt_merge ones used in section 3
+_cm_src = pathlib.Path(_repo_root, 'my_merge_rna', 'correlations', 'com_maxent.py').read_text()
+_cm_defs = [n for n in ast.parse(_cm_src).body if isinstance(n, ast.FunctionDef)
+            and n.name in ('forward_model_fixed_params', 'precompute_read_factors',
+                           'precompute_log_read_likelihood', '_loss_and_ratio_sum',
+                           'forward_model', 'forward_model_chunked')]
+cm = {'np': np, 'logsumexp': logsumexp, 'csr_matrix': csr_matrix}
+exec(compile(ast.Module(body=_cm_defs, type_ignores=[]), 'com_maxent.py', 'exec'), cm)
+
 # %%
 # =============================================================================
 # Configuration
 # =============================================================================
 SEQ = 'CACACACUUUUGUGUGUGUUUUCACACAC'
+# SEQ = 'CAGUGACUUUUGUCACUGUUUUCAGUGAC'
 # SEQ = 'CACACACUUUUGUGUGUGUUUUCACACACUUUUCACACAC'
 
 CONC_MM = 80
 TEMP_C = 37
-N_READS = 50000
+N_READS = 150000
 ALPHA = 1.0
-STATE_BIAS1 = -2.5
-STATE_BIAS2 = -3.5
-STATE_POSITIONS = [[6, 11], [17, 22]]   # extremes of the 3' CACACAC and of GUGUGUG
-BOUNDS_SC = 5.
-DELTA_SUBOPT = 10   # kcal/mol
+ALPHA_MAXENT = 10.0
+favor_loop_ends = True   # if True, bias the 3' hairpin (GUGUGUG paired with the last CACACAC)
+if favor_loop_ends:
+      STATE_BIAS1 = -2.5
+      STATE_BIAS2 = -3.5
+      STATE_POSITIONS = [[6, 11], [17, 22]]   # extremes of the 3' CACACAC and of GUGUGUG
+else:
+      # STATE_BIAS1 = -2.5 # this goes to s_i*s_j for 6,11
+      # STATE_BIAS2 = -3.5 # this goes to s_i*s_j for 17,22
+      # STATE_BIAS3 = -10.5 # this goes to (1-s_i)*(1-s_j) for 6,11
+      # STATE_POSITIONS = [[6, 11], [17, 22]]   # extremes of the 3' CACACAC and of GUGUGUG
+
+      # PAIR_BIAS = -3.5
+      # SINGLE_STATE_BIAS = 1.5
+      # STATE_POSITIONS = [22, 23]  
+
+      # STATE_BIASES = np.random.uniform(-5,5, 10)
+      # twenty_rand_pos = np.random.choice(range(1, len(SEQ)-1), 20, replace=False)
+      # STATE_POSITIONS = [[i, j] for i, j in zip(twenty_rand_pos[::2], twenty_rand_pos[1::2])]
+
+      STATE_BIAS1 = 0.
+      STATE_BIAS2 = 0.
+      STATE_BIAS3 = -2.
+      STATE_POSITIONS = [[6, 11], [17, 22], [25,26,27]]   # extremes of the 3' CACACAC and of GUGUGUG
+
+# Optional hand-picked true ensemble: list of (dot-bracket, free energy in kcal/mol). When not None it
+# replaces the biased bussi ensemble above; populations are Boltzmann weights exp(-E/kT) normalized over the list.
+TRUE_STRUCTURES = None
+# TRUE_STRUCTURES = [('.((......))(((((((....)))))))', -6.0063596855674355),
+#                    ('((((((......))))))...........', -5.979769768943948),
+#                    ('(((((((....))))))).(......)..', -5.906359780934867)]
+
+BOUNDS_SC = 15.
+DELTA_SUBOPT = 20   # kcal/mol
 
 phase1_params = os.path.join(os.environ['RNA_STRUCT_HOME'], 'fits_paper', 'designed_sequence',
                              'experimental', 'strand_disp_turner.txt')
@@ -77,7 +119,8 @@ bussi.set_random_seed(42)
 # =============================================================================
 N = len(SEQ)
 # position_mask = np.ones(N, dtype=bool)
-position_mask = np.array([nb != 'G' and nb != 'U' for nb in SEQ])
+position_mask = np.array([nb != 'U' for nb in SEQ])
+#position_mask = np.array([nb != 'G' and nb != 'U' for nb in SEQ])
 _dummy_df = pd.DataFrame({'pos': np.arange(1, N + 1), 'ref_nt': list(SEQ),
                           'mut_count': np.zeros(N, dtype=int), 'total_count': N_READS * np.ones(N, dtype=int)})
 exp_dummy = Experiment.from_dataframe(_dummy_df, seq=SEQ, system_name='CAhairpin', conc_mM=CONC_MM, temp_C=TEMP_C)
@@ -111,16 +154,47 @@ print(f"penalty = {penalty:.4f} kcal/mol, a_i in [{a_i.min():.4f},{a_i.max():.4f
 # =============================================================================
 # 1. Synthetic experiment from the biased ensemble
 # =============================================================================
-bias1 = [[0, 0], [0, STATE_BIAS1]]
-bias2 = [[0, 0], [0, STATE_BIAS2]]
-mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), state_positions=STATE_POSITIONS,
+
+if favor_loop_ends:
+    bias1 = [[0, 0], [0, STATE_BIAS1]]
+    bias2 = [[0, 0], [0, STATE_BIAS2]]
+    mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), state_positions=STATE_POSITIONS,
                           state_biases=[bias1, bias2], temperature=TEMP_C + 273.15)
+else:
+      # bias = [[[0, 0], [0, state_bias]] for state_bias in STATE_BIASES]
+      # mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), state_positions=STATE_POSITIONS,
+      #                     state_biases=bias, temperature=TEMP_C + 273.15)
+    
+    #mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), temperature=TEMP_C + 273.15, base_pair_biases=[(STATE_POSITIONS[0], STATE_POSITIONS[1], PAIR_BIAS)])
+      bias =[[[0, 0], [0, STATE_BIAS1]],[[0, 0], [0, STATE_BIAS2]],[[[0, 0], [0, 0]],[[0, 0], [0, STATE_BIAS3]]]]
+      mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), state_positions=STATE_POSITIONS,
+                          state_biases=bias, temperature=TEMP_C + 273.15)
+    
+
+
 mol_prior = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), temperature=TEMP_C + 273.15)
-bpp_true = mol_true.base_pairing_probability().sum(1)
 bpp_prior = mol_prior.base_pairing_probability().sum(1)
 
-sampled_states, _ = bussi.sample_to_numpy(mol_true.sample(N_READS), deduplicate=False)
-paired = sampled_states != -1
+if TRUE_STRUCTURES is None:
+    bpp_true = mol_true.base_pairing_probability().sum(1)
+    corr_true = mol_true.pairing_correlation_matrix() - np.outer(bpp_true, bpp_true)
+    sampled_states, _ = bussi.sample_to_numpy(mol_true.sample(N_READS), deduplicate=False)
+    paired = sampled_states != -1
+else:
+    # finite true ensemble of hand-picked structures
+    assert all(len(db) == N for db, _ in TRUE_STRUCTURES), "dot-bracket length != sequence length"
+    pairing_states_true = np.array([[c != '.' for c in db] for db, _ in TRUE_STRUCTURES], dtype=float)
+    _E_true = np.array([E for _, E in TRUE_STRUCTURES])
+    _lw_true = -_E_true / (bussi._KB * (TEMP_C + 273.15))
+    p_true = np.exp(_lw_true - logsumexp(_lw_true))
+    print("true ensemble populations: " + ", ".join(f"{db} {p:.3f}" for (db, _), p in zip(TRUE_STRUCTURES, p_true)))
+    bpp_true = p_true @ pairing_states_true
+    corr_true = (pairing_states_true.T * p_true) @ pairing_states_true - np.outer(bpp_true, bpp_true)
+    # one structure per read, drawn with probability p_true (same distribution as the inverse-CDF loop
+    # u ~ U(0,1), pick the first k with u < cumsum(p_true)[k])
+    true_idx = np.random.choice(len(p_true), size=N_READS, p=p_true)
+    paired = pairing_states_true[true_idx].astype(bool)
+    print("sampled fractions: " + ", ".join(f"{f:.3f}" for f in np.bincount(true_idx, minlength=len(p_true)) / N_READS))
 reacted = np.random.random(paired.shape) < np.where(paired, p_react_paired, p_react_unpaired)
 mutated = np.random.random(paired.shape) < np.where(reacted, 1 - prob_fn, prob_fp)
 
@@ -132,10 +206,53 @@ counts_df.to_csv(os.path.join(OUTPUT_DIR, 'synthetic_counts.csv'), index=False)
 np.save(os.path.join(OUTPUT_DIR, 'eps_b.npy'), eps_b)
 
 # %%
+# =============================================================================
+# 1.1 Plot pairing state and correlations of true and prior ensembles
+# =============================================================================
 
-plt.plot(bpp_prior)
-plt.plot(bpp_true)
+fig, ax = plt.subplots(1, 1, figsize=(6, 4.5))
+ax.plot(bpp_prior, 'k:', label='prior (penalty only)')
+ax.plot(bpp_true, 'k-', lw=2, alpha=0.4, label='true (biased at sites)')
+ax.set_xticks(range(N))
+ax.set_xlabel('Site')
+ax.set_ylabel('Base Pairing Probability')
+ax.legend()
+fig.tight_layout()
+plt.show()
 
+# Figure 2: connected pairing correlation matrix (prior)
+corr_prior = mol_prior.pairing_correlation_matrix() - np.matmul(np.atleast_2d(bpp_prior).T, np.atleast_2d(bpp_prior))
+
+vmax = max(np.abs(corr_prior).max(), np.abs(corr_true).max())
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), sharey=True)
+for ax, corr, title in zip(axes, (corr_prior, corr_true), ('prior', 'true')):
+    im = ax.imshow(corr, cmap='bwr', vmin=-vmax, vmax=vmax)
+    ax.set_title(f'pairing correlation matrix ({title})')
+    ax.set_xlabel('Site')
+axes[0].set_ylabel('Site')
+fig.colorbar(im, ax=axes, label='connected pairing correlation')
+plt.show()
+
+# %%
+# =============================================================================
+# 1.2 Save the read-level data (multiple mutations per read), com_maxent.py format
+# =============================================================================
+# mutations on masked (G/U) sites are ignored by the likelihood, so drop them before deduplicating
+mutated_obs = mutated & position_mask[None, :]
+unique_reads, read_occurrences = np.unique(mutated_obs, axis=0, return_counts=True)
+reads_int_list = [np.where(r)[0].tolist() for r in unique_reads]
+N_reads_unique = read_occurrences.astype(float)
+
+reads_df = pd.DataFrame({'mut_positions': reads_int_list, 'occurrences': read_occurrences})
+reads_df.to_csv(os.path.join(OUTPUT_DIR, 'synthetic_reads.csv'), index=False)
+np.save(os.path.join(OUTPUT_DIR, 'synthetic_reads_mask.npy'), position_mask)
+
+# consistency with the per-site counts at the observed sites
+site_counts_from_reads = np.zeros(N)
+for r, n in zip(reads_int_list, read_occurrences):
+    site_counts_from_reads[r] += n
+assert np.array_equal(site_counts_from_reads[position_mask], mut_counts[position_mask])
+print(f"saved {len(reads_int_list)} unique reads ({N_READS} total) to synthetic_reads.csv")
 
 # %%
 # =============================================================================
@@ -145,9 +262,9 @@ bpp_target, sigma_squared = compute_expansion_parameters(mut_counts.astype(float
 boundaries_mask = bounds_array_with_mask(N, position_mask, BOUNDS_SC)
 
 res_chi2, bpp_maxent_out = maxent(SEQ, bpp_target, sigma_squared=sigma_squared, penalty=penalty,
-                                  boundaries=boundaries_mask, alpha=ALPHA, T=TEMP_C)
+                                  boundaries=boundaries_mask, alpha=ALPHA_MAXENT, T=TEMP_C)
 lambda_sc = res_chi2.x
-np.savetxt(os.path.join(OUTPUT_DIR, f'lambda_sc_maxent_chi2_alpha{ALPHA:g}.txt'), lambda_sc)
+np.savetxt(os.path.join(OUTPUT_DIR, f'lambda_sc_maxent_chi2_alpha{ALPHA_MAXENT:g}.txt'), lambda_sc)
 print(f"maxent: success={res_chi2.success} nit={res_chi2.nit} |grad|={np.linalg.norm(res_chi2.jac):.2e} "
       f"n_at_bound={np.sum(np.isclose(np.abs(lambda_sc), BOUNDS_SC))}")
 
@@ -225,6 +342,228 @@ ax.set_xlabel('structure rank'); ax.set_ylabel('probability'); ax.legend(fontsiz
 ax.set_title(f'subopt: {states.shape[0]} structures within {DELTA_SUBOPT} kcal/mol, coverage of Z = {coverage:.6f}')
 fig.tight_layout()
 fig.savefig(os.path.join(OUTPUT_DIR, f'fixed_point_check_delta_{DELTA_SUBOPT}.png'), dpi=120)
+plt.show()
+
+# %%
+# =============================================================================
+# 4. Read-level (multi-mutation) optimization of the maxent-corrected suboptimal ensemble
+#    (com_maxent.py forward model: P = P0 W / Z, KL w.r.t. the penalized Vienna prior)
+# =============================================================================
+ALPHA_READS_LIST = [1, 10, 100]
+
+S = states.shape[0]
+R = len(reads_int_list)
+# P0 = maxent-corrected ensemble on the suboptimal set (logweights), KL reference = penalized Vienna prior (logweights_ref)
+mutation_matrix = cm['forward_model_fixed_params'](states, a_i, b_i, mask=position_mask)
+X, D, base = cm['precompute_read_factors'](reads_int_list, mutation_matrix, position_mask)
+USE_DENSE = R * S <= 2e7
+if USE_DENSE:
+    logM = cm['precompute_log_read_likelihood'](reads_int_list, mutation_matrix, position_mask)
+
+def make_obj(alpha):
+    if USE_DENSE:
+        return lambda W: cm['forward_model'](N_reads_unique, W, logweights, logM, alpha=alpha, logweights_ref=logweights_ref)
+    return lambda W: cm['forward_model_chunked'](N_reads_unique, W, logweights, X, D, base, alpha=alpha, logweights_ref=logweights_ref)
+
+# finite-difference check of the gradient (wrt W) before optimizing
+_rng = np.random.default_rng(0)
+_W = np.exp(0.3 * _rng.standard_normal(S))
+_dir = _rng.standard_normal(S)
+_obj = make_obj(ALPHA_READS_LIST[1])
+_h = 1e-6
+_fd = (_obj(_W + _h * _dir)[0] - _obj(_W - _h * _dir)[0]) / (2 * _h)
+_an = _obj(_W)[1] @ _dir
+print(f"gradient check: FD={_fd:.6e} analytic={_an:.6e} rel.err={abs(_fd - _an) / abs(_an):.2e}")
+
+bounds = [(np.finfo(np.float64).eps, None)] * S
+pairing_states = (states != -1).astype(float)
+bpp_reads, P_reads = {}, {}
+nll_of = lambda W: make_obj(0)(W)[0]
+print(f"reads: {R} unique, {S} structures, {'dense' if USE_DENSE else 'chunked'} logM; "
+      f"-logL at W=1 (maxent ensemble) = {nll_of(np.ones(S)):.2f}")
+for a in ALPHA_READS_LIST:
+    res_r = minimize(make_obj(a), np.ones(S), jac=True, method='L-BFGS-B', bounds=bounds)
+    lw_r = np.log(res_r.x) + logweights
+    P_reads[a] = np.exp(lw_r - logsumexp(lw_r))
+    bpp_reads[a] = P_reads[a] @ pairing_states
+    print(f"alpha={a:g}: success={res_r.success} nit={res_r.nit} loss={res_r.fun:.2f} -logL={nll_of(res_r.x):.2f} "
+          f"KL(P||P_ref)={kl_P(P_reads[a]):.4f} max|bpp-bpp_maxent|={np.abs(bpp_reads[a] - bpp_subopt_start).max():.4f}")
+
+# %%
+# =============================================================================
+# 4.1 Compare pairing probabilities and (connected) pairing correlations with the true ensemble
+# =============================================================================
+def connected_corr(P):
+    bpp = P @ pairing_states
+    return (pairing_states.T * P) @ pairing_states - np.outer(bpp, bpp)
+
+corr_maxent_full = mol_fit.pairing_correlation_matrix() - np.outer(bpp_fit, bpp_fit)
+corr_maxent_trunc = connected_corr(P_fit)
+corr_reads = {a: connected_corr(P_reads[a]) for a in ALPHA_READS_LIST}
+
+obs = np.where(position_mask)[0]
+candidates = {'prior': corr_prior, 'maxent (full ensemble)': corr_maxent_full, 'maxent (subopt set)': corr_maxent_trunc}
+candidates.update({f'reads subopt, alpha={a:g}': corr_reads[a] for a in ALPHA_READS_LIST})
+bpp_of = {'prior': bpp_prior, 'maxent (full ensemble)': bpp_fit, 'maxent (subopt set)': bpp_subopt_start}
+bpp_of.update({f'reads subopt, alpha={a:g}': bpp_reads[a] for a in ALPHA_READS_LIST})
+
+rows = []
+for name, C in candidates.items():
+    dC = C - corr_true
+    rows.append({'ensemble': name,
+                 'bpp_max_abs_err': np.abs(bpp_of[name] - bpp_true).max(),
+                 'bpp_rmse': np.sqrt(np.mean((bpp_of[name] - bpp_true) ** 2)),
+                 'corr_frob_all': np.linalg.norm(dC),
+                 'corr_maxabs_all': np.abs(dC).max(),
+                 'corr_frob_observed': np.linalg.norm(dC[np.ix_(obs, obs)]),
+                 'corr_maxabs_observed': np.abs(dC[np.ix_(obs, obs)]).max()})
+metrics = pd.DataFrame(rows).set_index('ensemble')
+print(metrics.to_string(float_format=lambda v: f'{v:.4f}'))
+metrics.to_csv(os.path.join(OUTPUT_DIR, 'corr_metrics.csv'))
+
+for a in ALPHA_READS_LIST:
+    summary[f'bpp_reads_alpha{a:g}'] = bpp_reads[a]
+summary.to_csv(os.path.join(OUTPUT_DIR, 'summary.csv'), index_label='pos0')
+
+# Figure A: pairing probabilities
+fig, ax = plt.subplots(1, 1, figsize=(9, 4.5))
+ax.plot(bpp_prior, 'k:', label='prior (penalty only)')
+ax.plot(bpp_true, 'k-', lw=2, alpha=0.4, label='true')
+ax.plot(bpp_fit, 'C0o-', label='maxent chi2')
+for i, a in enumerate(ALPHA_READS_LIST):
+    ax.plot(bpp_reads[a], f'C{i + 1}--', marker='s', mfc='none', label=f'reads subopt, alpha={a:g}')
+ax.set_xticks(range(N)); ax.set_xticklabels(list(SEQ), fontsize=7)
+ax.set_ylabel('pairing probability'); ax.legend(fontsize=7)
+fig.tight_layout()
+plt.show()
+
+# Figure B: correlation matrices (top) and difference to the true one (bottom), shared symmetric color scales
+ncol = 2 + len(ALPHA_READS_LIST)
+mats = [('true', corr_true), ('maxent (subopt set)', corr_maxent_trunc)] + \
+       [(f'reads subopt, alpha={a:g}', corr_reads[a]) for a in ALPHA_READS_LIST]
+vmax = max(np.abs(M_).max() for _, M_ in mats)
+vmax_d = max(np.abs(M_ - corr_true).max() for _, M_ in mats[1:])
+fig, axes = plt.subplots(2, ncol, figsize=(3.6 * ncol, 7), sharex=True, sharey=True)
+for j, (title, M_) in enumerate(mats):
+    im1 = axes[0, j].imshow(M_, cmap='bwr', vmin=-vmax, vmax=vmax)
+    axes[0, j].set_title(title, fontsize=8)
+    if j == 0:
+        axes[1, j].axis('off')
+    else:
+        im2 = axes[1, j].imshow(M_ - corr_true, cmap='bwr', vmin=-vmax_d, vmax=vmax_d)
+        axes[1, j].set_title(f'{title} - true', fontsize=8)
+fig.colorbar(im1, ax=axes[0, :], label='connected pairing correlation', shrink=0.8)
+fig.colorbar(im2, ax=axes[1, :], label='difference to true', shrink=0.8)
+plt.show()
+
+# %%
+# =============================================================================
+# 5. Same read-level optimization, starting from the plain Vienna suboptimal ensemble (no maxent correction)
+#    P0 = KL reference = penalized Vienna prior on its own suboptimal set (states_0, logweights_0 from section 3)
+# =============================================================================
+def run_reads_optimization(states_, logweights0_, logweights_ref_, alphas):
+    """Read-likelihood reweighting (com_maxent forward model) of a suboptimal set, one L-BFGS-B run per alpha.
+    Returns {alpha: P} with P the normalized optimized probabilities of the structures."""
+    S_ = states_.shape[0]
+    mm = cm['forward_model_fixed_params'](states_, a_i, b_i, mask=position_mask)
+    if R * S_ <= 2e7:
+        logM_ = cm['precompute_log_read_likelihood'](reads_int_list, mm, position_mask)
+        obj_of = lambda a: (lambda W: cm['forward_model'](N_reads_unique, W, logweights0_, logM_,
+                                                           alpha=a, logweights_ref=logweights_ref_))
+    else:
+        X_, D_, base_ = cm['precompute_read_factors'](reads_int_list, mm, position_mask)
+        obj_of = lambda a: (lambda W: cm['forward_model_chunked'](N_reads_unique, W, logweights0_, X_, D_, base_,
+                                                                   alpha=a, logweights_ref=logweights_ref_))
+    nll = lambda W: obj_of(0)(W)[0]
+    kl = lambda P: P @ (np.log(P) - logweights_ref_)
+    print(f"  {S_} structures, -logL at W=1 = {nll(np.ones(S_)):.2f}")
+    out = {}
+    for a in alphas:
+        res_ = minimize(obj_of(a), np.ones(S_), jac=True, method='L-BFGS-B',
+                        bounds=[(np.finfo(np.float64).eps, None)] * S_)
+        lw_ = np.log(res_.x) + logweights0_
+        out[a] = np.exp(lw_ - logsumexp(lw_))
+        print(f"  alpha={a:g}: success={res_.success} nit={res_.nit} loss={res_.fun:.2f} "
+              f"-logL={nll(res_.x):.2f} KL(P||P_ref)={kl(out[a]):.4f}")
+    return out
+
+logweights_0_norm = logweights_0 - logsumexp(logweights_0)
+pairing_states_0 = (states_0 != -1).astype(float)
+coverage_0 = mol_prior.suboptimal_coverage(DELTA_SUBOPT)
+print(f"reads subopt from the Vienna (no sc) ensemble, delta={DELTA_SUBOPT} kcal/mol, coverage of Z = {coverage_0:.6f}")
+P_reads_0 = run_reads_optimization(states_0, logweights_0_norm, logweights_0_norm, ALPHA_READS_LIST)
+bpp_reads_0 = {a: P @ pairing_states_0 for a, P in P_reads_0.items()}
+
+def connected_corr_of(P, pstates):
+    bpp = P @ pstates
+    return (pstates.T * P) @ pstates - np.outer(bpp, bpp)
+
+corr_vienna_trunc = connected_corr_of(np.exp(logweights_0_norm), pairing_states_0)
+corr_reads_0 = {a: connected_corr_of(P, pairing_states_0) for a, P in P_reads_0.items()}
+corr_subopt_from_prior = connected_corr_of(np.exp(lw0_opt - logsumexp(lw0_opt)), pairing_states_0)
+
+# %%
+# =============================================================================
+# 5.1 Compare: maxent-corrected start vs Vienna start (pairing probabilities and correlations)
+# =============================================================================
+candidates.update({'Vienna (subopt set)': corr_vienna_trunc,
+                   'per-site subopt from Vienna': corr_subopt_from_prior})
+candidates.update({f'reads subopt from Vienna, alpha={a:g}': corr_reads_0[a] for a in ALPHA_READS_LIST})
+bpp_of.update({'Vienna (subopt set)': np.exp(logweights_0_norm) @ pairing_states_0,
+               'per-site subopt from Vienna': bpp_subopt_from_prior})
+bpp_of.update({f'reads subopt from Vienna, alpha={a:g}': bpp_reads_0[a] for a in ALPHA_READS_LIST})
+
+rows = []
+for name, C in candidates.items():
+    dC = C - corr_true
+    rows.append({'ensemble': name,
+                 'bpp_max_abs_err': np.abs(bpp_of[name] - bpp_true).max(),
+                 'bpp_rmse': np.sqrt(np.mean((bpp_of[name] - bpp_true) ** 2)),
+                 'corr_frob_all': np.linalg.norm(dC),
+                 'corr_maxabs_all': np.abs(dC).max(),
+                 'corr_frob_observed': np.linalg.norm(dC[np.ix_(obs, obs)]),
+                 'corr_maxabs_observed': np.abs(dC[np.ix_(obs, obs)]).max()})
+metrics = pd.DataFrame(rows).set_index('ensemble')
+print(metrics.to_string(float_format=lambda v: f'{v:.4f}'))
+metrics.to_csv(os.path.join(OUTPUT_DIR, 'corr_metrics.csv'))
+
+for a in ALPHA_READS_LIST:
+    summary[f'bpp_reads_from_vienna_alpha{a:g}'] = bpp_reads_0[a]
+summary.to_csv(os.path.join(OUTPUT_DIR, 'summary.csv'), index_label='pos0')
+
+# Figure C: pairing probabilities, maxent start (left) vs Vienna start (right)
+fig, axes = plt.subplots(1, 2, figsize=(15, 4.5), sharey=True)
+for ax, title, bpp_start, bpp_runs in ((axes[0], 'start: maxent-corrected ensemble', bpp_fit, bpp_reads),
+                                        (axes[1], 'start: Vienna ensemble (no sc)', bpp_prior, bpp_reads_0)):
+    ax.plot(bpp_prior, 'k:', label='prior (penalty only)')
+    ax.plot(bpp_true, 'k-', lw=2, alpha=0.4, label='true')
+    ax.plot(bpp_fit, 'C0o-', ms=4, label='maxent chi2')
+    for i, a in enumerate(ALPHA_READS_LIST):
+        ax.plot(bpp_runs[a], f'C{i + 1}--', marker='s', mfc='none', label=f'reads subopt, alpha={a:g}')
+    ax.set_xticks(range(N)); ax.set_xticklabels(list(SEQ), fontsize=7)
+    ax.set_title(title)
+    ax.legend(fontsize=7)
+axes[0].set_ylabel('pairing probability')
+fig.tight_layout()
+plt.show()
+
+# Figure D: correlations from the Vienna start (top) and difference to the true one (bottom)
+mats = [('true', corr_true), ('Vienna (subopt set)', corr_vienna_trunc)] + \
+       [(f'reads from Vienna, alpha={a:g}', corr_reads_0[a]) for a in ALPHA_READS_LIST]
+ncol = len(mats)
+vmax = max(np.abs(M_).max() for _, M_ in mats)
+vmax_d = max(np.abs(M_ - corr_true).max() for _, M_ in mats[1:])
+fig, axes = plt.subplots(2, ncol, figsize=(3.6 * ncol, 7), sharex=True, sharey=True)
+for j, (title, M_) in enumerate(mats):
+    im1 = axes[0, j].imshow(M_, cmap='bwr', vmin=-vmax, vmax=vmax)
+    axes[0, j].set_title(title, fontsize=8)
+    if j == 0:
+        axes[1, j].axis('off')
+    else:
+        im2 = axes[1, j].imshow(M_ - corr_true, cmap='bwr', vmin=-vmax_d, vmax=vmax_d)
+        axes[1, j].set_title(f'{title} - true', fontsize=8)
+fig.colorbar(im1, ax=axes[0, :], label='connected pairing correlation', shrink=0.8)
+fig.colorbar(im2, ax=axes[1, :], label='difference to true', shrink=0.8)
 plt.show()
 
 # %%
