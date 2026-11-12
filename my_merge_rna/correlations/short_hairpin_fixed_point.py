@@ -60,16 +60,17 @@ exec(compile(ast.Module(body=_cm_defs, type_ignores=[]), 'com_maxent.py', 'exec'
 # =============================================================================
 # Configuration
 # =============================================================================
-SEQ = 'CACACACUUUUGUGUGUGUUUUCACACAC'
+SEQ = 'UAAGACUUCGGUCUUA' # should form a loop at UUCG in the middle
+# SEQ = 'CACACACUUUUGUGUGUGUUUUCACACAC'
 # SEQ = 'CAGUGACUUUUGUCACUGUUUUCAGUGAC'
 # SEQ = 'CACACACUUUUGUGUGUGUUUUCACACACUUUUCACACAC'
 
 CONC_MM = 80
 TEMP_C = 37
-N_READS = 150000
+N_READS = 50000
 ALPHA = 1.0
-ALPHA_MAXENT = 10.0
-favor_loop_ends = True   # if True, bias the 3' hairpin (GUGUGUG paired with the last CACACAC)
+ALPHA_MAXENT = 1
+favor_loop_ends = False   # if True, bias the 3' hairpin (GUGUGUG paired with the last CACACAC)
 if favor_loop_ends:
       STATE_BIAS1 = -2.5
       STATE_BIAS2 = -3.5
@@ -80,28 +81,38 @@ else:
       # STATE_BIAS3 = -10.5 # this goes to (1-s_i)*(1-s_j) for 6,11
       # STATE_POSITIONS = [[6, 11], [17, 22]]   # extremes of the 3' CACACAC and of GUGUGUG
 
-      # PAIR_BIAS = -3.5
-      # SINGLE_STATE_BIAS = 1.5
-      # STATE_POSITIONS = [22, 23]  
+      PAIR_BIAS = -3.5
+      SINGLE_STATE_BIAS = 1.5
+      STATE_POSITIONS = [[2, 3, 13]] 
 
       # STATE_BIASES = np.random.uniform(-5,5, 10)
       # twenty_rand_pos = np.random.choice(range(1, len(SEQ)-1), 20, replace=False)
       # STATE_POSITIONS = [[i, j] for i, j in zip(twenty_rand_pos[::2], twenty_rand_pos[1::2])]
 
-      STATE_BIAS1 = 0.
-      STATE_BIAS2 = 0.
-      STATE_BIAS3 = -2.
-      STATE_POSITIONS = [[6, 11], [17, 22], [25,26,27]]   # extremes of the 3' CACACAC and of GUGUGUG
+    #   STATE_BIAS1 = 0.
+    #   STATE_BIAS2 = 0.
+    #   STATE_BIAS3 = -2.
+    #   STATE_POSITIONS = [[6, 11], [17, 22], [25,26,27]]   # extremes of the 3' CACACAC and of GUGUGUG
 
 # Optional hand-picked true ensemble: list of (dot-bracket, free energy in kcal/mol). When not None it
 # replaces the biased bussi ensemble above; populations are Boltzmann weights exp(-E/kT) normalized over the list.
+
 TRUE_STRUCTURES = None
 # TRUE_STRUCTURES = [('.((......))(((((((....)))))))', -6.0063596855674355),
 #                    ('((((((......))))))...........', -5.979769768943948),
 #                    ('(((((((....))))))).(......)..', -5.906359780934867)]
 
+# TRUE_STRUCTURES = [('.(.(((....))).).', 1.14682013218233153),
+#                    ('..((.(....).).).', 1.773410102449999), 
+#                    ('..((........))..', 1.773410102449999)]
+
 BOUNDS_SC = 15.
 DELTA_SUBOPT = 20   # kcal/mol
+# Read-level reweighting optimizer. Optimizing W directly is badly scaled: L-BFGS-B stops on a tiny projected
+# gradient in W (~1e-6) while dL/dlogW is still O(1). Optimizing theta = log W (unconstrained) fixes this.
+# ftol is RELATIVE to |f| (~1e5 here), so it is tightened from scipy's 2.2e-9; gtol acts on dL/dlogW.
+OPTIMIZE_LOGW = True
+LBFGS_OPTIONS = dict(ftol=1e-12, gtol=1e-4, maxiter=5000, maxfun=10000)
 
 phase1_params = os.path.join(os.environ['RNA_STRUCT_HOME'], 'fits_paper', 'designed_sequence',
                              'experimental', 'strand_disp_turner.txt')
@@ -118,8 +129,8 @@ bussi.set_random_seed(42)
 # Physical model for the new sequence (dummy Experiment, only used for calculations)
 # =============================================================================
 N = len(SEQ)
-# position_mask = np.ones(N, dtype=bool)
-position_mask = np.array([nb != 'U' for nb in SEQ])
+position_mask = np.ones(N, dtype=bool)
+# position_mask = np.array([nb != 'U' for nb in SEQ])
 #position_mask = np.array([nb != 'G' and nb != 'U' for nb in SEQ])
 _dummy_df = pd.DataFrame({'pos': np.arange(1, N + 1), 'ref_nt': list(SEQ),
                           'mut_count': np.zeros(N, dtype=int), 'total_count': N_READS * np.ones(N, dtype=int)})
@@ -166,8 +177,10 @@ else:
       #                     state_biases=bias, temperature=TEMP_C + 273.15)
     
     #mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), temperature=TEMP_C + 273.15, base_pair_biases=[(STATE_POSITIONS[0], STATE_POSITIONS[1], PAIR_BIAS)])
-      bias =[[[0, 0], [0, STATE_BIAS1]],[[0, 0], [0, STATE_BIAS2]],[[[0, 0], [0, 0]],[[0, 0], [0, STATE_BIAS3]]]]
-      mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), state_positions=STATE_POSITIONS,
+    #   bias =[[[0, 0], [0, STATE_BIAS1]],[[0, 0], [0, STATE_BIAS2]],[[[0, 0], [0, 0]],[[0, 0], [0, STATE_BIAS3]]]]
+    bias =[[[[0, 0], [0, -6]],[[0, -6], [0, 0]]]]
+
+    mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), state_positions=STATE_POSITIONS,
                           state_biases=bias, temperature=TEMP_C + 273.15)
     
 
@@ -274,6 +287,17 @@ bpp_fit = mol_fit.base_pairing_probability().sum(1)
 # maxent's second output is bpp_ref - jac + alpha*beta*sigma^2*lambda = the Vienna bpp at the solution
 print(f"max |bpp(bussi, penalty+lambda_sc) - bpp(maxent vienna)| = {np.abs(bpp_fit - bpp_maxent_out).max():.2e}")
 
+corr_maxent_full = mol_fit.pairing_correlation_matrix() - np.outer(bpp_fit, bpp_fit)
+
+vmax = max(np.abs(corr_maxent_full).max(), np.abs(corr_true).max())
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), sharey=True)
+for ax, corr, title in zip(axes, (corr_maxent_full, corr_true), ('Merge-rNA fit', 'true')):
+    im = ax.imshow(corr, cmap='bwr', vmin=-vmax, vmax=vmax)
+    ax.set_title(f'pairing correlation matrix ({title})')
+    ax.set_xlabel('Site')
+axes[0].set_ylabel('Site')
+fig.colorbar(im, ax=axes, label='connected pairing correlation')
+plt.show()
 # %%
 # =============================================================================
 # 3. subopt_merge on the sc-corrected ensemble: is W=1 a fixed point?
@@ -375,6 +399,47 @@ _fd = (_obj(_W + _h * _dir)[0] - _obj(_W - _h * _dir)[0]) / (2 * _h)
 _an = _obj(_W)[1] @ _dir
 print(f"gradient check: FD={_fd:.6e} analytic={_an:.6e} rel.err={abs(_fd - _an) / abs(_an):.2e}")
 
+def minimize_W(obj, W0, bounds_):
+    """L-BFGS-B on the weights W (bounded) or on theta = log W (unconstrained, OPTIMIZE_LOGW).
+    obj(W) -> (loss, dloss/dW). The returned res.x is always W."""
+    if OPTIMIZE_LOGW:
+        def obj_theta(th):
+            W = np.exp(np.clip(th, -700., 700.))
+            f_, gW = obj(W)
+            return f_, W * gW
+        res_ = minimize(obj_theta, np.log(W0), jac=True, method='L-BFGS-B', options=LBFGS_OPTIONS)
+        res_.x = np.exp(np.clip(res_.x, -700., 700.))
+        return res_
+    return minimize(obj, W0, jac=True, method='L-BFGS-B', bounds=bounds_, options=LBFGS_OPTIONS)
+
+def report_convergence(res, obj, logw0, pstates, bounds_, label=''):
+    """Print convergence diagnostics of an L-BFGS-B run on W and restart it from res.x.
+    The objective is convex in P (NLL and KL both convex) and P = P0 W/Z covers the simplex interior, so any
+    stationary point is the global optimum: a restart that still lowers the loss means the first run stopped early.
+    Returns the restarted result (never worse than res)."""
+    W = res.x
+    _, g = obj(W)
+    g_logW = W * g                                  # gradient wrt log W
+    at_bound = (W <= 10 * bounds_[0][0]) if not OPTIMIZE_LOGW else np.zeros(len(W), bool)
+    msg = str(res.message)
+    stop = ('projected gradient' if 'PROJ' in msg.upper() or 'GRAD' in msg.upper() else
+            'f-reduction (may be early)' if 'REDUCTION' in msg.upper() or 'FACTR' in msg.upper() else msg)
+    print(f"  [{label}] stop: {stop} | nit={res.nit} nfev={res.nfev}")
+    print(f"  [{label}] max|dL/dlogW| (free) = {np.abs(g_logW[~at_bound]).max() if (~at_bound).any() else 0:.2e}, "
+          f"sum W*dL/dW = {g_logW.sum():.2e} (should be 0, scale invariance), "
+          f"{at_bound.sum()} at bound, min grad there = {g[at_bound].min() if at_bound.any() else 0:.2e} (KKT: >= 0)")
+    res2 = minimize_W(obj, W, bounds_)
+    P_of = lambda W_: np.exp(np.log(W_) + logw0 - logsumexp(np.log(W_) + logw0))
+    P1, P2 = P_of(W), P_of(res2.x)
+    dcorr = np.linalg.norm(connected_corr_of(P2, pstates) - corr_true) - np.linalg.norm(connected_corr_of(P1, pstates) - corr_true)
+    print(f"  [{label}] restart: dloss = {res.fun - res2.fun:.3e} (nit={res2.nit}), "
+          f"max|dbpp| = {np.abs((P2 - P1) @ pstates).max():.2e}, d(corr error) = {dcorr:.2e}")
+    return res2
+
+def connected_corr_of(P, pstates):
+    bpp = P @ pstates
+    return (pstates.T * P) @ pstates - np.outer(bpp, bpp)
+
 bounds = [(np.finfo(np.float64).eps, None)] * S
 pairing_states = (states != -1).astype(float)
 bpp_reads, P_reads = {}, {}
@@ -382,7 +447,8 @@ nll_of = lambda W: make_obj(0)(W)[0]
 print(f"reads: {R} unique, {S} structures, {'dense' if USE_DENSE else 'chunked'} logM; "
       f"-logL at W=1 (maxent ensemble) = {nll_of(np.ones(S)):.2f}")
 for a in ALPHA_READS_LIST:
-    res_r = minimize(make_obj(a), np.ones(S), jac=True, method='L-BFGS-B', bounds=bounds)
+    res_r = minimize_W(make_obj(a), np.ones(S), bounds)
+    res_r = report_convergence(res_r, make_obj(a), logweights, pairing_states, bounds, label=f'maxent start, alpha={a:g}')
     lw_r = np.log(res_r.x) + logweights
     P_reads[a] = np.exp(lw_r - logsumexp(lw_r))
     bpp_reads[a] = P_reads[a] @ pairing_states
@@ -461,9 +527,9 @@ plt.show()
 # 5. Same read-level optimization, starting from the plain Vienna suboptimal ensemble (no maxent correction)
 #    P0 = KL reference = penalized Vienna prior on its own suboptimal set (states_0, logweights_0 from section 3)
 # =============================================================================
-def run_reads_optimization(states_, logweights0_, logweights_ref_, alphas):
+def run_reads_optimization(states_, logweights0_, logweights_ref_, alphas, W_start=None, label='Vienna start'):
     """Read-likelihood reweighting (com_maxent forward model) of a suboptimal set, one L-BFGS-B run per alpha.
-    Returns {alpha: P} with P the normalized optimized probabilities of the structures."""
+    Returns ({alpha: P}, {alpha: final loss}) with P the normalized optimized probabilities of the structures."""
     S_ = states_.shape[0]
     mm = cm['forward_model_fixed_params'](states_, a_i, b_i, mask=position_mask)
     if R * S_ <= 2e7:
@@ -477,26 +543,41 @@ def run_reads_optimization(states_, logweights0_, logweights_ref_, alphas):
     nll = lambda W: obj_of(0)(W)[0]
     kl = lambda P: P @ (np.log(P) - logweights_ref_)
     print(f"  {S_} structures, -logL at W=1 = {nll(np.ones(S_)):.2f}")
-    out = {}
+    out, losses = {}, {}
+    bounds_ = [(np.finfo(np.float64).eps, None)] * S_
+    x0 = np.ones(S_) if W_start is None else W_start
+    pstates_ = (states_ != -1).astype(float)
     for a in alphas:
-        res_ = minimize(obj_of(a), np.ones(S_), jac=True, method='L-BFGS-B',
-                        bounds=[(np.finfo(np.float64).eps, None)] * S_)
+        res_ = minimize_W(obj_of(a), x0, bounds_)
+        res_ = report_convergence(res_, obj_of(a), logweights0_, pstates_, bounds_, label=f'{label}, alpha={a:g}')
+        losses[a] = res_.fun
         lw_ = np.log(res_.x) + logweights0_
         out[a] = np.exp(lw_ - logsumexp(lw_))
         print(f"  alpha={a:g}: success={res_.success} nit={res_.nit} loss={res_.fun:.2f} "
               f"-logL={nll(res_.x):.2f} KL(P||P_ref)={kl(out[a]):.4f}")
-    return out
+    return out, losses
 
 logweights_0_norm = logweights_0 - logsumexp(logweights_0)
 pairing_states_0 = (states_0 != -1).astype(float)
 coverage_0 = mol_prior.suboptimal_coverage(DELTA_SUBOPT)
 print(f"reads subopt from the Vienna (no sc) ensemble, delta={DELTA_SUBOPT} kcal/mol, coverage of Z = {coverage_0:.6f}")
-P_reads_0 = run_reads_optimization(states_0, logweights_0_norm, logweights_0_norm, ALPHA_READS_LIST)
+P_reads_0, loss_reads_0 = run_reads_optimization(states_0, logweights_0_norm, logweights_0_norm, ALPHA_READS_LIST)
 bpp_reads_0 = {a: P @ pairing_states_0 for a, P in P_reads_0.items()}
 
-def connected_corr_of(P, pstates):
-    bpp = P @ pstates
-    return (pstates.T * P) @ pstates - np.outer(bpp, bpp)
+# Two starts, same problem: on the Vienna set (same structures, same KL reference) start from the maxent-corrected
+# probabilities, W_start = P_maxent / P_vienna. The problem is convex in P, so both runs must reach the same loss.
+_E_fit_0 = np.apply_along_axis(mol_fit.evaluate, 1, states_0)
+_logP_maxent_0 = -_E_fit_0 / (bussi._KB * (TEMP_C + 273.15))
+_logP_maxent_0 -= logsumexp(_logP_maxent_0)
+W_start_maxent = np.exp(_logP_maxent_0 - logweights_0_norm)
+print("two-starts test on the Vienna set, start W = P_maxent / P_vienna:")
+P_reads_0b, loss_reads_0b = run_reads_optimization(states_0, logweights_0_norm, logweights_0_norm, ALPHA_READS_LIST,
+                                                   W_start=W_start_maxent, label='Vienna set, maxent W_start')
+for a in ALPHA_READS_LIST:
+    print(f"  alpha={a:g}: loss(W=1 start) - loss(maxent start) = {loss_reads_0[a] - loss_reads_0b[a]:.3e}, "
+          f"max|dbpp| = {np.abs((P_reads_0[a] - P_reads_0b[a]) @ pairing_states_0).max():.2e}, "
+          f"corr error {np.linalg.norm(connected_corr_of(P_reads_0[a], pairing_states_0) - corr_true):.4f} vs "
+          f"{np.linalg.norm(connected_corr_of(P_reads_0b[a], pairing_states_0) - corr_true):.4f}")
 
 corr_vienna_trunc = connected_corr_of(np.exp(logweights_0_norm), pairing_states_0)
 corr_reads_0 = {a: connected_corr_of(P, pairing_states_0) for a, P in P_reads_0.items()}
