@@ -69,7 +69,7 @@ CONC_MM = 80
 TEMP_C = 37
 N_READS = 50000
 ALPHA = 1.0
-ALPHA_MAXENT = 1
+ALPHA_MAXENT = 10
 favor_loop_ends = False   # if True, bias the 3' hairpin (GUGUGUG paired with the last CACACAC)
 if favor_loop_ends:
       STATE_BIAS1 = -2.5
@@ -81,9 +81,11 @@ else:
       # STATE_BIAS3 = -10.5 # this goes to (1-s_i)*(1-s_j) for 6,11
       # STATE_POSITIONS = [[6, 11], [17, 22]]   # extremes of the 3' CACACAC and of GUGUGUG
 
-      PAIR_BIAS = -3.5
-      SINGLE_STATE_BIAS = 1.5
-      STATE_POSITIONS = [[2, 3, 13]] 
+    #   PAIR_BIAS = -3.5
+    #   SINGLE_STATE_BIAS = 1.5
+    #   STATE_POSITIONS = [[2, 3, 13]] 
+    simplebias1 = (0,14,-20)
+    simplebias2 = (7,12,-20)
 
       # STATE_BIASES = np.random.uniform(-5,5, 10)
       # twenty_rand_pos = np.random.choice(range(1, len(SEQ)-1), 20, replace=False)
@@ -97,14 +99,14 @@ else:
 # Optional hand-picked true ensemble: list of (dot-bracket, free energy in kcal/mol). When not None it
 # replaces the biased bussi ensemble above; populations are Boltzmann weights exp(-E/kT) normalized over the list.
 
-TRUE_STRUCTURES = None
+# TRUE_STRUCTURES = None
 # TRUE_STRUCTURES = [('.((......))(((((((....)))))))', -6.0063596855674355),
 #                    ('((((((......))))))...........', -5.979769768943948),
 #                    ('(((((((....))))))).(......)..', -5.906359780934867)]
 
-# TRUE_STRUCTURES = [('.(.(((....))).).', 1.14682013218233153),
+TRUE_STRUCTURES = [('.(.(((....))).).', 1.14682013218233153),
 #                    ('..((.(....).).).', 1.773410102449999), 
-#                    ('..((........))..', 1.773410102449999)]
+                   ('..((........))..', 1.773410102449999)]
 
 BOUNDS_SC = 15.
 DELTA_SUBOPT = 20   # kcal/mol
@@ -129,8 +131,8 @@ bussi.set_random_seed(42)
 # Physical model for the new sequence (dummy Experiment, only used for calculations)
 # =============================================================================
 N = len(SEQ)
-position_mask = np.ones(N, dtype=bool)
-# position_mask = np.array([nb != 'U' for nb in SEQ])
+# position_mask = np.ones(N, dtype=bool)
+position_mask = np.array([nb != 'U' for nb in SEQ])
 #position_mask = np.array([nb != 'G' and nb != 'U' for nb in SEQ])
 _dummy_df = pd.DataFrame({'pos': np.arange(1, N + 1), 'ref_nt': list(SEQ),
                           'mut_count': np.zeros(N, dtype=int), 'total_count': N_READS * np.ones(N, dtype=int)})
@@ -166,23 +168,24 @@ print(f"penalty = {penalty:.4f} kcal/mol, a_i in [{a_i.min():.4f},{a_i.max():.4f
 # 1. Synthetic experiment from the biased ensemble
 # =============================================================================
 
-if favor_loop_ends:
-    bias1 = [[0, 0], [0, STATE_BIAS1]]
-    bias2 = [[0, 0], [0, STATE_BIAS2]]
-    mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), state_positions=STATE_POSITIONS,
-                          state_biases=[bias1, bias2], temperature=TEMP_C + 273.15)
-else:
-      # bias = [[[0, 0], [0, state_bias]] for state_bias in STATE_BIASES]
-      # mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), state_positions=STATE_POSITIONS,
-      #                     state_biases=bias, temperature=TEMP_C + 273.15)
+# if favor_loop_ends:
+#     bias1 = [[0, 0], [0, STATE_BIAS1]]
+#     bias2 = [[0, 0], [0, STATE_BIAS2]]
+#     mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), state_positions=STATE_POSITIONS,
+#                           state_biases=[bias1, bias2], temperature=TEMP_C + 273.15)
+# else:
+#       # bias = [[[0, 0], [0, state_bias]] for state_bias in STATE_BIASES]
+#       # mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), state_positions=STATE_POSITIONS,
+#       #                     state_biases=bias, temperature=TEMP_C + 273.15)
     
-    #mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), temperature=TEMP_C + 273.15, base_pair_biases=[(STATE_POSITIONS[0], STATE_POSITIONS[1], PAIR_BIAS)])
-    #   bias =[[[0, 0], [0, STATE_BIAS1]],[[0, 0], [0, STATE_BIAS2]],[[[0, 0], [0, 0]],[[0, 0], [0, STATE_BIAS3]]]]
-    bias =[[[[0, 0], [0, -6]],[[0, -6], [0, 0]]]]
+#     #mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), temperature=TEMP_C + 273.15, base_pair_biases=[(STATE_POSITIONS[0], STATE_POSITIONS[1], PAIR_BIAS)])
+#     #   bias =[[[0, 0], [0, STATE_BIAS1]],[[0, 0], [0, STATE_BIAS2]],[[[0, 0], [0, 0]],[[0, 0], [0, STATE_BIAS3]]]]
+#     # bias =[[[[0, 0], [0, -6]],[[0, -6], [0, 0]]]]
 
-    mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), state_positions=STATE_POSITIONS,
-                          state_biases=bias, temperature=TEMP_C + 273.15)
-    
+#     #mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), state_positions=STATE_POSITIONS,
+#     #                      state_biases=bias, temperature=TEMP_C + 273.15)
+#     mol_true = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), base_pair_biases=[simplebias1, simplebias2], temperature=TEMP_C + 273.15)
+        
 
 
 mol_prior = bussi.Molecule(SEQ, lambdas1d=penalty * np.ones(N), temperature=TEMP_C + 273.15)
@@ -373,7 +376,9 @@ plt.show()
 # 4. Read-level (multi-mutation) optimization of the maxent-corrected suboptimal ensemble
 #    (com_maxent.py forward model: P = P0 W / Z, KL w.r.t. the penalized Vienna prior)
 # =============================================================================
-ALPHA_READS_LIST = [1, 10, 100]
+# ALPHA_READS_LIST = [1, 10, 100]
+ALPHA_READS_LIST = [1]
+
 
 S = states.shape[0]
 R = len(reads_int_list)
@@ -393,7 +398,7 @@ def make_obj(alpha):
 _rng = np.random.default_rng(0)
 _W = np.exp(0.3 * _rng.standard_normal(S))
 _dir = _rng.standard_normal(S)
-_obj = make_obj(ALPHA_READS_LIST[1])
+_obj = make_obj(ALPHA_READS_LIST[0])
 _h = 1e-6
 _fd = (_obj(_W + _h * _dir)[0] - _obj(_W - _h * _dir)[0]) / (2 * _h)
 _an = _obj(_W)[1] @ _dir
@@ -504,16 +509,17 @@ fig.tight_layout()
 plt.show()
 
 # Figure B: correlation matrices (top) and difference to the true one (bottom), shared symmetric color scales
-ncol = 2 + len(ALPHA_READS_LIST)
-mats = [('true', corr_true), ('maxent (subopt set)', corr_maxent_trunc)] + \
-       [(f'reads subopt, alpha={a:g}', corr_reads[a]) for a in ALPHA_READS_LIST]
+ncol = 2 + len(ALPHA_READS_LIST) + 1
+mats = [('true', corr_true)] + \
+       [(f'reads subopt, alpha={a:g}', corr_reads[a]) for a in ALPHA_READS_LIST] + \
+       [('maxent (subopt set)', corr_maxent_trunc), ('Vienna', corr_prior)]
 vmax = max(np.abs(M_).max() for _, M_ in mats)
 vmax_d = max(np.abs(M_ - corr_true).max() for _, M_ in mats[1:])
 fig, axes = plt.subplots(2, ncol, figsize=(3.6 * ncol, 7), sharex=True, sharey=True)
 for j, (title, M_) in enumerate(mats):
     im1 = axes[0, j].imshow(M_, cmap='bwr', vmin=-vmax, vmax=vmax)
     axes[0, j].set_title(title, fontsize=8)
-    if j == 0:
+    if j == 0 or j==0 + 2 + len(ALPHA_READS_LIST):
         axes[1, j].axis('off')
     else:
         im2 = axes[1, j].imshow(M_ - corr_true, cmap='bwr', vmin=-vmax_d, vmax=vmax_d)
